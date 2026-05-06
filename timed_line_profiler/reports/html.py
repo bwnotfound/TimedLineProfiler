@@ -140,6 +140,10 @@ def render_html(
         is_default = v_idx == 0
         row_labels = [f"{os.path.basename(fn)}:{ln}" for fn, ln in keys]
         code_snips = [linecache.getline(fn, ln).strip()[:80] for fn, ln in keys]
+        # legend 单独使用更丰富的 label：行号 + 代码片段，便于看曲线时识别
+        legend_labels = [
+            f"{row_labels[i]} │ {code_snips[i][:40]}" for i in range(len(keys))
+        ]
 
         # heatmap z（log 时取 log10）
         if use_log:
@@ -184,7 +188,7 @@ def render_html(
                 x=bucket_labels,
                 y=matrix[i],
                 mode="lines+markers",
-                name=row_labels[i],
+                name=legend_labels[i],
                 visible=is_default,
                 hovertemplate=f"{row_labels[i]}<br>%{{x}}: %{{y:.3f}} ms<extra></extra>",
             )
@@ -272,7 +276,8 @@ def render_html(
     heatmap_h = max(220, n * 16 + 100)
     line_h = 320
     table_h = max(200, n * 24 + 80)
-    total_h = heatmap_h + line_h + table_h + 250
+    legend_h = 110  # 给底部水平 legend 预留（带代码片段后单条较长，可能占 2-3 行）
+    total_h = heatmap_h + line_h + table_h + 250 + legend_h
 
     fig.update_layout(
         title=(
@@ -282,6 +287,20 @@ def render_html(
         ),
         height=total_h,
         showlegend=True,
+        # legend 水平排在整图下方，避开右侧的 colorbar；name 含代码片段便于识别
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.02,
+            xanchor="left",
+            x=0.0,
+            bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="#dddddd",
+            borderwidth=1,
+            font=dict(size=10, family="monospace"),
+            itemsizing="constant",
+        ),
+        margin=dict(b=legend_h + 20),
         updatemenus=[
             dict(
                 buttons=buttons,
