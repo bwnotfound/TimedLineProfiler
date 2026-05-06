@@ -4,14 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "timed-line-profiler"
-version = "0.1.0"
+version = "0.1.1"
 description = "带时间窗口的逐行性能分析器，支持 GPU 同步、起止触发器与 HTML 可视化"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { file = "LICENSE" }
-authors = [
-    { name = "蓝白bw" },
-]
+authors = [{ name = "蓝白bw" }]
 keywords = ["profiler", "line-profiler", "performance", "training", "pytorch"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -25,9 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Debuggers",
 ]
-dependencies = [
-    "plotly>=5.0.0",
-]
+dependencies = ["plotly>=5.0.0"]
 
 [project.optional-dependencies]
 # 用 pip install "timed-line-profiler[torch]" 拉 torch
@@ -36,13 +32,15 @@ dev = ["pytest", "build", "twine"]
 
 [project.scripts]
 # 安装后获得 `tlprof` 命令
-tlprof = "timed_line_profiler.profiler:main"
+tlprof = "timed_line_profiler.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/yourname/LineProfiler"
 Issues = "https://github.com/yourname/LineProfiler/issues"
 
 # ---------------- setuptools 详细配置 ----------------
-[tool.setuptools]
-# flat layout：包就在仓库根目录下
-packages = ["timed_line_profiler"]
+[tool.setuptools.packages.find]
+# flat layout：包就在仓库根目录下；用 find 自动发现，含 reports 等子包
+where = ["."]
+include = ["timed_line_profiler*"]
+exclude = ["examples*", "tests*"]
