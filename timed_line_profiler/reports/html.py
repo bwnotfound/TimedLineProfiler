@@ -55,6 +55,8 @@ def render_html(
     out_path: str,
     top_k: int = 10,
     top_ratio_pct: float = 0.0,
+    max_file_views: int = 8,
+    all_files: bool = False,
 ):
     try:
         import plotly.graph_objects as go
@@ -77,14 +79,17 @@ def render_html(
     bucket_labels = [f"{i*bs:.1f}-{(i+1)*bs:.1f}s" for i in range(bucket_count)]
     total_ms_global = sum(t for t, _ in agg.values()) * 1000
 
-    # ---- 收集视图：[(label, keys, matrix, denom_ms_for_pct)] ----
+    # ---- 按文件分组（一次扫描，给后续单文件视图复用，避免重复 O(M) 扫描） ----
+    by_file_keys: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
     file_total: Dict[str, float] = defaultdict(float)
     for k, (t, _) in agg.items():
+        by_file_keys[k[0]].append(k)
         file_total[k[0]] += t
 
+    # ---- 决定要生成哪些视图 ----
     views: List[Tuple[str, List[Tuple[str, int]], List[List[float]], float]] = []
 
-    # 全局视图
+    # 全局视图（始终有）
     global_keys = select_keys_per_file(agg, top_k, top_ratio_pct)
     global_matrix = profiler.per_bucket_matrix(global_keys)
     views.append(
@@ -96,15 +101,27 @@ def render_html(
         )
     )
 
-    # 单文件视图（按文件耗时降序）
-    files_sorted = sorted(file_total.keys(), key=lambda f: -file_total[f])
-    for fn in files_sorted:
-        sub_agg = {k: v for k, v in agg.items() if k[0] == fn}
+    # 单文件视图：按文件耗时降序，受 max_file_views / all_files 限制
+    files_sorted = sorted(by_file_keys.keys(), key=lambda f: -file_total[f])
+    files_for_views = files_sorted if all_files else files_sorted[:max_file_views]
+    omitted_count = len(files_sorted) - len(files_for_views)
+
+    for fn in files_for_views:
+        # 用预分组好的 keys 构造 sub_agg，避免再次扫整个 agg（旧代码 O(F*M)，新代码 O(M)）
+        sub_agg = {k: agg[k] for k in by_file_keys[fn]}
         keys = select_keys_per_file(sub_agg, top_k, top_ratio_pct)
         matrix = profiler.per_bucket_matrix(keys)
         f_ms = file_total[fn] * 1000
         label = f"{os.path.basename(fn)} ({f_ms:.0f} ms)"
         views.append((label, keys, matrix, f_ms))
+
+    if omitted_count > 0:
+        print(
+            f"[info] HTML dropdown 仅含 top-{len(files_for_views)} 文件视图，"
+            f"其余 {omitted_count} 个文件未单独建视图（完整数据见 report.md）。"
+            f"如需全部，加 --html-all-files。",
+            file=sys.stderr,
+        )
 
     # ---- log scale 决策（基于全局视图的动态范围）----
     all_pos = [v for row in global_matrix for v in row if v > 0]
@@ -130,8 +147,12 @@ def render_html(
         vertical_spacing=0.06,
     )
 
-    # ---- 为每个视图构造 traces 并加入 figure ----
-    view_indices: List[List[int]] = []  # 每个视图占用的 trace 全局索引
+    # ---- 为每个视图构造 traces，最后一次性 add_traces（plotly add_trace 单次 deepcopy
+    # 开销较大，批量调用可省 ~10-20%；更主要是与限制视图数叠加） ----
+    all_traces: List = []
+    all_rows: List[int] = []
+    all_cols: List[int] = []
+    view_indices: List[List[int]] = []
     cur = 0
 
     for v_idx, (label, keys, matrix, denom_ms) in enumerate(views):
@@ -166,33 +187,39 @@ def render_html(
             for i in range(n_keys)
         ]
 
-        heatmap = go.Heatmap(
-            z=z,
-            x=bucket_labels,
-            y=row_labels,
-            colorscale="Viridis",
-            colorbar=colorbar,
-            text=hover,
-            hoverinfo="text",
-            visible=is_default,
-            showscale=True,
+        all_traces.append(
+            go.Heatmap(
+                z=z,
+                x=bucket_labels,
+                y=row_labels,
+                colorscale="Viridis",
+                colorbar=colorbar,
+                text=hover,
+                hoverinfo="text",
+                visible=is_default,
+                showscale=True,
+            )
         )
-        fig.add_trace(heatmap, row=1, col=1)
+        all_rows.append(1)
+        all_cols.append(1)
         idx_set.append(cur)
         cur += 1
 
         # 折线（top 10）
         n_lines = min(10, n_keys)
         for i in range(n_lines):
-            line = go.Scatter(
-                x=bucket_labels,
-                y=matrix[i],
-                mode="lines+markers",
-                name=legend_labels[i],
-                visible=is_default,
-                hovertemplate=f"{row_labels[i]}<br>%{{x}}: %{{y:.3f}} ms<extra></extra>",
+            all_traces.append(
+                go.Scatter(
+                    x=bucket_labels,
+                    y=matrix[i],
+                    mode="lines+markers",
+                    name=legend_labels[i],
+                    visible=is_default,
+                    hovertemplate=f"{row_labels[i]}<br>%{{x}}: %{{y:.3f}} ms<extra></extra>",
+                )
             )
-            fig.add_trace(line, row=2, col=1)
+            all_rows.append(2)
+            all_cols.append(1)
             idx_set.append(cur)
             cur += 1
 
@@ -217,27 +244,40 @@ def render_html(
                 ]
             )
 
-        table = go.Table(
-            header=dict(
-                values=["行", "总耗时(ms)", "调用次数", "平均(ms)", pct_header, "代码"],
-                fill_color="#3a3a3a",
-                font=dict(color="white"),
-                align="left",
-            ),
-            cells=dict(
-                values=list(zip(*table_rows)) if table_rows else [[] for _ in range(6)],
-                align="left",
-                font=dict(size=11),
-                height=22,
-            ),
-            visible=is_default,
+        all_traces.append(
+            go.Table(
+                header=dict(
+                    values=[
+                        "行",
+                        "总耗时(ms)",
+                        "调用次数",
+                        "平均(ms)",
+                        pct_header,
+                        "代码",
+                    ],
+                    fill_color="#3a3a3a",
+                    font=dict(color="white"),
+                    align="left",
+                ),
+                cells=dict(
+                    values=(
+                        list(zip(*table_rows)) if table_rows else [[] for _ in range(6)]
+                    ),
+                    align="left",
+                    font=dict(size=11),
+                    height=22,
+                ),
+                visible=is_default,
+            )
         )
-        fig.add_trace(table, row=3, col=1)
+        all_rows.append(3)
+        all_cols.append(1)
         idx_set.append(cur)
         cur += 1
 
         view_indices.append(idx_set)
 
+    fig.add_traces(all_traces, rows=all_rows, cols=all_cols)
     total_traces = cur
 
     # ---- dropdown buttons ----

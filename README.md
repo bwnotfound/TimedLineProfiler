@@ -185,6 +185,7 @@ tlprof --target 'src/**/*.py' \
 - 内含：
   - `report.html` — plotly 交互式报告
     - **顶部文件 dropdown**：默认"全部文件"视图，可切换到任一单文件视图，热力图/折线/表格/标题同步更新
+    - **dropdown 限制 top-N 文件**（默认 8，可用 `--html-max-file-views` 调整，或 `--html-all-files` 全量）：避免文件多时 HTML 体积爆炸；完整数据始终在 `report.md` 里
     - 热力图、折线图在动态范围 > 50 倍时**自动启用 log scale**（避免 outlier 压扁画面）
     - 高度按选中行数自适应
   - `report.md` — 完整聚合数据
@@ -277,6 +278,8 @@ timed_line_profiler/
 | `--top-k`                  | 每个文件至少选 k 行（默认 10）                                        |
 | `--top-ratio PCT`          | 占文件总耗时 ≥ PCT% 的行也选上，与 top-k 取并集（默认 0）             |
 | `--threshold-ms`           | 报告中过滤总耗时低于该值的行                                          |
+| `--html-max-file-views N`  | HTML dropdown 中最多列出 top-N 个单文件视图（默认 8）                 |
+| `--html-all-files`         | HTML dropdown 列出全部文件（覆盖 max-file-views，HTML 会变大）        |
 
 ## 已知局限
 

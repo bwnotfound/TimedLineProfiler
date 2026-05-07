@@ -122,6 +122,21 @@ def main():
         default=0.0,
         help="报告中过滤总耗时低于该值的行（ms）",
     )
+    parser.add_argument(
+        "--html-max-file-views",
+        type=int,
+        default=8,
+        metavar="N",
+        help="HTML dropdown 中最多列出 top-N 个单文件视图（按文件耗时降序）；"
+        "默认 8。文件数很多时可降低 HTML 体积和加载时间。"
+        "完整数据始终保留在 report.md 中",
+    )
+    parser.add_argument(
+        "--html-all-files",
+        action="store_true",
+        help="HTML dropdown 中列出所有文件视图（覆盖 --html-max-file-views）；"
+        "文件多时 HTML 会很大，仅在确实需要时开启",
+    )
     parser.add_argument("script", help="要执行的训练脚本")
     parser.add_argument(
         "script_args", nargs=argparse.REMAINDER, help="传给训练脚本的参数"
@@ -219,15 +234,38 @@ def main():
             profiler.stop()
         finally:
             print("\n" + "=" * 100, file=sys.stderr)
+            # 记录汇总：在写入报告前打印，让用户能立即看到记录结果概况
+            agg = profiler.aggregate()  # 已缓存，几乎零开销
+            files_count = len({fn for fn, _ in agg.keys()})
+            lines_count = len(agg)
+            total_hits = sum(c for _, c in agg.values())
+            total_in_target_ms = sum(t for t, _ in agg.values()) * 1000
+            bucket_count = profiler.max_bucket + 1 if profiler.bucket_data else 0
+            rec_dur = profiler.recording_duration
+            rec_dur_str = f"{rec_dur*1000:.2f} ms" if rec_dur is not None else "未记录"
+
+            print("[TimedLineProfiler] 记录已结束，准备生成报告 ...", file=sys.stderr)
+            print(f"  记录时长:     {rec_dur_str}", file=sys.stderr)
+            print(f"  涉及文件数:   {files_count}", file=sys.stderr)
+            print(f"  命中行数:     {lines_count} (去重)", file=sys.stderr)
+            print(f"  总命中次数:   {total_hits}", file=sys.stderr)
+            print(f"  目标内总耗时: {total_in_target_ms:.2f} ms", file=sys.stderr)
             print(
-                "[TimedLineProfiler] 训练结束/中断，开始生成报告 ...", file=sys.stderr
+                f"  时间窗口:     {bucket_count} 个 × {args.bucket} s", file=sys.stderr
             )
+            print("=" * 100, file=sys.stderr)
+
             text = render_text(profiler, threshold_ms=args.threshold_ms)
             print(text)
             html_path = os.path.join(args.out, "report.html")
             md_path = os.path.join(args.out, "report.md")
             render_html(
-                profiler, html_path, top_k=args.top_k, top_ratio_pct=args.top_ratio
+                profiler,
+                html_path,
+                top_k=args.top_k,
+                top_ratio_pct=args.top_ratio,
+                max_file_views=args.html_max_file_views,
+                all_files=args.html_all_files,
             )
             render_markdown(
                 profiler,

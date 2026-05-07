@@ -50,12 +50,19 @@ class TimedLineProfiler:
         )
 
         self.start_wall: Optional[float] = None
+        self.recording_duration: Optional[float] = None  # recording 实际持续时长（秒）
         self.last_line: Optional[Tuple[str, int]] = None
         self.last_time: Optional[float] = None
         self.previous_trace = None
         self.enabled = False
         self.max_bucket = 0
         self._fname_cache: Dict[str, Optional[str]] = {}
+
+        # 报告生成期的缓存（stop 后才会被填充，避免重复计算）
+        self._agg_cache: Optional[Dict[Tuple[str, int], List]] = None
+        self._inverted_cache: Optional[
+            Dict[Tuple[str, int], List[Tuple[int, float]]]
+        ] = None
 
         self._cuda_sync_fn = None
         if cuda_sync:
@@ -208,6 +215,7 @@ class TimedLineProfiler:
             self.stop_hit += 1
             if self.stop_hit >= self.stop_trigger[2]:
                 self.recording = False
+                self.recording_duration = now - self.start_wall
                 self.last_line = None
                 print(
                     f"[info] 触发停止记录: {fn}:{lineno} 第 {self.stop_hit} 次",
@@ -224,6 +232,7 @@ class TimedLineProfiler:
             self._profile_hits_count += 1
             if self._profile_hits_count >= self.profile_hits:
                 self.recording = False
+                self.recording_duration = now - self.start_wall
                 self.last_line = None
                 print(
                     f"[info] 触发停止记录: --profile-hits 达到 "
@@ -239,6 +248,7 @@ class TimedLineProfiler:
             and now - self.start_wall >= self.max_duration
         ):
             self.recording = False
+            self.recording_duration = now - self.start_wall
             self.last_line = None
             print(
                 f"[info] 触发停止记录: --max-duration {self.max_duration}s 到时 "
@@ -283,26 +293,50 @@ class TimedLineProfiler:
             slot = self.bucket_data[bucket][self.last_line]
             slot[0] += elapsed
             slot[1] += 1
+            # 程序自然退出但 stop trigger 没触发：用此刻作为 recording 结束时刻
+            if self.recording_duration is None:
+                self.recording_duration = now - self.start_wall
         sys.settrace(self.previous_trace)
         self.enabled = False
 
     # ---- 数据导出 ---------------------------------------------------------
 
     def aggregate(self) -> Dict[Tuple[str, int], List]:
+        """聚合所有 bucket 得到 (file, line) -> [total_time_s, count]。
+
+        结果会缓存在 _agg_cache，避免被三个 render 各自重新计算。
+        """
+        if self._agg_cache is not None:
+            return self._agg_cache
         agg: Dict[Tuple[str, int], List] = defaultdict(lambda: [0.0, 0])
         for bucket in self.bucket_data.values():
             for k, (t, c) in bucket.items():
                 agg[k][0] += t
                 agg[k][1] += c
+        self._agg_cache = agg
         return agg
+
+    def _build_inverted(self) -> Dict[Tuple[str, int], List[Tuple[int, float]]]:
+        """构建倒排索引 (file, line) -> [(bucket_idx, ms), ...]，仅一次。
+
+        让 per_bucket_matrix(keys) 不必每次扫整个 bucket_data —— 在多视图
+        HTML 渲染时这很关键（F+1 个视图各调一次原本是 O(F * 总 cell)）。
+        """
+        if self._inverted_cache is not None:
+            return self._inverted_cache
+        inv: Dict[Tuple[str, int], List[Tuple[int, float]]] = defaultdict(list)
+        for b, bucket in self.bucket_data.items():
+            for k, (t, _) in bucket.items():
+                inv[k].append((b, t * 1000.0))
+        self._inverted_cache = inv
+        return inv
 
     def per_bucket_matrix(self, keys: List[Tuple[str, int]]) -> List[List[float]]:
         """返回 [len(keys)][num_buckets] 的耗时矩阵，单位毫秒。"""
         n_b = self.max_bucket + 1 if self.bucket_data else 1
+        inv = self._build_inverted()
         matrix = [[0.0] * n_b for _ in keys]
-        idx = {k: i for i, k in enumerate(keys)}
-        for b, bucket in self.bucket_data.items():
-            for k, (t, _) in bucket.items():
-                if k in idx:
-                    matrix[idx[k]][b] = t * 1000.0
+        for i, k in enumerate(keys):
+            for b, ms in inv.get(k, ()):
+                matrix[i][b] = ms
         return matrix
