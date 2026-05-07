@@ -283,6 +283,33 @@ def main():
         runpy.run_path(args.script, run_name="__main__")
     except KeyboardInterrupt:
         print("\n[info] 收到 KeyboardInterrupt，将生成报告 ...", file=sys.stderr)
+    except SystemExit:
+        # 用户脚本主动 sys.exit() 是正常路径，原样传递给上层
+        raise
+    except BaseException as e:
+        # 训练脚本抛任何其它异常：吞掉而不重新抛，让 profiler 仍能输出已采集数据
+        # （重抛会让 main() 异常退出，atexit 仍会跑，但 finally 里我们已经主动 finalize）
+        import traceback
+
+        print(f"\n[warn] 训练脚本异常退出: {type(e).__name__}: {e}", file=sys.stderr)
+        print(
+            "[info] profiler 将尝试输出已采集到的数据。完整异常 traceback：",
+            file=sys.stderr,
+        )
+        traceback.print_exc(file=sys.stderr)
+    finally:
+        # 立刻关 trace —— 防止异常处理 / cleanup 代码在 trace 激活下运行
+        # 引发更多次级问题（典型场景：C++ 扩展销毁器中调用 Python 回调）
+        try:
+            profiler.stop()
+        except Exception as e:
+            print(f"[warn] profiler.stop() 失败: {e}", file=sys.stderr)
+        # 主动调一次 finalize 落盘 —— 训练脚本若是 C++ abort()/SIGKILL
+        # 终止进程会绕过 atexit，主动调用是唯一保险
+        try:
+            finalize()
+        except Exception as e:
+            print(f"[warn] finalize() 失败，已采集数据可能未写入: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -281,6 +281,27 @@ timed_line_profiler/
 | `--html-max-file-views N`  | HTML dropdown 中最多列出 top-N 个单文件视图（默认 8）                 |
 | `--html-all-files`         | HTML dropdown 列出全部文件（覆盖 max-file-views，HTML 会变大）        |
 
+## 异常退出与崩溃排查
+
+profiler 尽力在程序异常退出时仍输出已采集到的数据：
+
+| 退出方式                     | 报告是否生成 | 备注                           |
+| ---------------------------- | ------------ | ------------------------------ |
+| 正常结束 / `sys.exit(N)`     | ✅            | exit code 透传                 |
+| `KeyboardInterrupt` (Ctrl+C) | ✅            |                                |
+| 训练脚本抛 Python 异常       | ✅            | 异常 traceback 也会打印        |
+| 训练脚本被 `kill -9` / OOM   | ❌            | 进程被立刻终止，无任何机会落盘 |
+| 训练脚本触发 C++ `abort()`   | ❌            | 同上，绕过 atexit              |
+
+异常发生时，profiler 会**立刻关闭 `sys.settrace`**，避免在异常 unwind 路径（C++ 销毁器、`__del__`、teardown 等）上继续 trace。这能减少 trace 与 C 扩展（如 PyTorch / Lightning）异常清理代码相互干扰导致的次级崩溃。
+
+**遇到崩溃如何排查**
+
+如果训练在 lightning / pytorch 内部崩溃（典型症状如 `RuntimeError: unknown parameter type`、`pure virtual method called` 之类），**先做对照实验**：把同样的命令去掉 `tlprof` 部分直接跑，看是否同样崩溃。
+
+- 同样崩溃 → 与 profiler 无关，是训练环境本身的兼容性问题（lightning vs torch 版本、optimizer state 类型等），需要在不带 profiler 的环境里先解决
+- 仅 tlprof 下崩溃 → 是 profiler 的 trace 干扰，请提交 issue 并附上完整 traceback
+
 ## 已知局限
 
 - 子进程（如 DataLoader workers）不会被追踪，只追踪主进程
