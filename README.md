@@ -15,6 +15,8 @@
 | **每文件 top-k + ratio 并集选行**                  | ❌             | ✅                   |
 | HTML 可视化（含 log scale 自适应 + 文件 dropdown） | ❌             | ✅                   |
 | Markdown 完整聚合报告                              | ❌             | ✅                   |
+| **函数级耗时（含 yield 正确处理）**                | ❌             | ✅                   |
+| **多线程支持（per-thread 数据）**                  | ❌             | ✅                   |
 
 ## 安装
 
@@ -264,6 +266,13 @@ finally:
 print(render_text(profiler))
 render_html(profiler, "rep/report.html", top_k=10, top_ratio_pct=1.0)
 render_markdown(profiler, "rep/report.md", top_k=10, top_ratio_pct=1.0)
+
+# 下钻到单个线程：
+for t in profiler.list_threads():
+    agg_t = profiler.aggregate(thread=t['tid'])
+    funcs_t = profiler.aggregate_funcs(thread=t['tid'])
+    total_ms = sum(_t for _t, _ in agg_t.values()) * 1000
+    print(f"{t['name']:20s} {total_ms:8.2f} ms  {len(agg_t)} 行")
 ```
 
 ## 模块结构
@@ -285,23 +294,24 @@ timed_line_profiler/
 
 ## 关键参数速查
 
-| 参数                       | 说明                                                                  |
-| -------------------------- | --------------------------------------------------------------------- |
-| `--target`                 | 目标文件；可重复，单个内可用逗号分隔；FS glob 优先 + 相对路径模式兜底 |
-| `--exclude`                | 排除文件 glob；可重复，单个内可用逗号分隔                             |
-| `--exclude-from`           | gitignore 风格排除规则文件；可重复，单个内可用逗号分隔                |
-| `--bucket`                 | 时间窗口大小（秒）                                                    |
-| `--start-at FILE:LINE[:N]` | 该行命中第 N 次时开始记录（N 默认 1）                                 |
-| `--stop-at FILE:LINE[:M]`  | 该行命中第 M 次时停止记录（M 默认 1，绝对计数）                       |
-| `--profile-hits M`         | 开始记录后 --start-at 那行再命中 M 次后停止（相对计数）               |
-| `--max-duration SEC`       | 开始记录后最多 SEC 秒就停止；与上述 stop 条件 OR 关系                 |
-| `--cuda-sync`              | 每个目标行后调 `torch.cuda.synchronize()`                             |
-| `--out`                    | 输出目录（不存在时自动创建），生成 report.html + report.md            |
-| `--top-k`                  | 每个文件至少选 k 行（默认 10）                                        |
-| `--top-ratio PCT`          | 占文件总耗时 ≥ PCT% 的行也选上，与 top-k 取并集（默认 0）             |
-| `--threshold-ms`           | 报告中过滤总耗时低于该值的行                                          |
-| `--html-max-file-views N`  | HTML dropdown 中最多列出 top-N 个单文件视图（默认 8）                 |
-| `--html-all-files`         | HTML dropdown 列出全部文件（覆盖 max-file-views，HTML 会变大）        |
+| 参数                         | 说明                                                                  |
+| ---------------------------- | --------------------------------------------------------------------- |
+| `--target`                   | 目标文件；可重复，单个内可用逗号分隔；FS glob 优先 + 相对路径模式兜底 |
+| `--exclude`                  | 排除文件 glob；可重复，单个内可用逗号分隔                             |
+| `--exclude-from`             | gitignore 风格排除规则文件；可重复，单个内可用逗号分隔                |
+| `--bucket`                   | 时间窗口大小（秒）                                                    |
+| `--start-at FILE:LINE[:N]`   | 该行命中第 N 次时开始记录（N 默认 1）                                 |
+| `--stop-at FILE:LINE[:M]`    | 该行命中第 M 次时停止记录（M 默认 1，绝对计数）                       |
+| `--profile-hits M`           | 开始记录后 --start-at 那行再命中 M 次后停止（相对计数）               |
+| `--max-duration SEC`         | 开始记录后最多 SEC 秒就停止；与上述 stop 条件 OR 关系                 |
+| `--cuda-sync`                | 每个目标行后调 `torch.cuda.synchronize()`                             |
+| `--out`                      | 输出目录（不存在时自动创建），生成 report.html + report.md            |
+| `--top-k`                    | 每个文件至少选 k 行（默认 10）                                        |
+| `--top-ratio PCT`            | 占文件总耗时 ≥ PCT% 的行也选上，与 top-k 取并集（默认 0）             |
+| `--threshold-ms`             | 报告中过滤总耗时低于该值的行                                          |
+| `--html-max-file-views N`    | HTML dropdown 中最多列出 top-N 个单文件视图（默认 8）                 |
+| `--html-all-files`           | HTML dropdown 列出全部文件（覆盖 max-file-views，HTML 会变大）        |
+| `--main-thread-only-trigger` | 只让主线程参与 trigger 计数；默认任意线程命中都算                     |
 
 ## 异常退出与崩溃排查
 
@@ -335,9 +345,67 @@ profiler 尽力在程序异常退出时仍输出已采集到的数据：
 
 例子（已在 `examples/` 中给出）：caller 在 yield 之间 sleep 1.5s 不会被算到 generator 函数上，generator 仅记录它自己 yield 段的真实工作时间。
 
+## 多线程支持
+
+Python 同进程内的子线程（`threading.Thread` / `ThreadPoolExecutor`）会被自动 trace。每个线程的数据独立采集（**无锁**——每个线程只写自己的 dict），最后报告里既可以看合并视图，也可以下钻到单个线程。
+
+### 工作机制
+
+`profiler.start()` 调用 `threading.settrace(_global_trace)`——这之后**新创建**的所有 Python 线程会自动被 trace。已存在的线程不受影响（但启动 profiler 时通常只有主线程，所以无所谓）。
+
+数据结构：
+
+```python
+profiler._thread_state[tid] = {
+    'last_line', 'last_time',           # per-thread 状态，互不干扰
+    'bucket_data', 'func_bucket_data',  # per-thread 累加
+    'meta': {
+        'name', 'is_main', 'order',
+        'first_seen_perf', 'first_seen_wall',  # 相对+绝对时间戳
+        'last_seen_perf',  'last_seen_wall',
+    },
+}
+```
+
+每条数据的 thread_id 始终独立，互相不踩。
+
+### 报告呈现
+
+text / md 报告：
+
+- 顶部"线程总览"列出每个线程的活跃时段、命中行数、命中次数、耗时
+- 文件/行/函数表是**合并视图**（所有线程数据加在一起）
+
+下钻到单线程的代码 API：
+
+```python
+# 通过 Python API（不用 cli），可以拿任意线程的独立数据：
+agg_main = profiler.aggregate(thread='main')        # 仅主线程
+agg_t    = profiler.aggregate(thread=tid)           # 指定线程
+agg_all  = profiler.aggregate()                     # 合并（默认）
+
+func_main = profiler.aggregate_funcs(thread='main')
+threads   = profiler.list_threads()                 # 所有线程的 meta 信息
+```
+
+> HTML 报告中的分线程下钻（dropdown 切换）和时间轴可视化（gantt-style 显示每线程的活跃区间，支持相对/绝对时间 toggle）将在后续版本中加入。
+
+### Trigger 在多线程下的语义
+
+- **默认**：start-at / stop-at / profile-hits 的 "N 次命中" 是**任何线程命中都算**（profiler-wide 计数）
+- **`--main-thread-only-trigger`**：只主线程命中才算。常用场景：你想精确控制 profile 主循环的第 N 步，避免 worker 线程干扰计数
+
+无论选哪种，trigger 一旦触发，**所有线程**都进入 recording 状态（recording 是 profiler 全局状态）。
+
+### 边界
+
+- **子进程不被支持**（如 PyTorch DataLoader workers / multiprocessing）。`sys.settrace` / `threading.settrace` 都跨不过进程边界。如果你的工作负载主要在子进程里，profiler 看不到
+- **C 扩展直接起的线程**（如 NumPy 内部的某些 OpenMP 池）也不受 `threading.settrace` 影响——只有用 Python `threading` 模块创建的线程会被 hook
+- **trace 已经存在的线程**没法注入。但 profiler 一般在 main 入口启动，那时候只有主线程
+
 ## 已知局限
 
-- 子进程（如 DataLoader workers）不会被追踪，只追踪主进程
+- 子进程（如 DataLoader workers、multiprocessing、DDP 不同 rank）不会被追踪——`sys.settrace` 跨不过进程边界。同进程内的子线程是支持的，详见"多线程支持"
 - `sys.settrace` 自带 5–30x slowdown；`--cuda-sync` 会进一步串行化 CPU/GPU
 - 与 `pdb` / `debugpy` 等同样使用 `sys.settrace` 的工具不能并存
 - DDP 多 rank 训练时，每个 rank 都会写报告，请加 RANK 区分输出目录

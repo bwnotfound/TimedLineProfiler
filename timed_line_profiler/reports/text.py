@@ -8,10 +8,38 @@ from ..profiler import TimedLineProfiler
 
 
 def render_text(profiler: TimedLineProfiler, threshold_ms: float = 0.0) -> str:
-    """生成 LineProfiler 风格的文本汇总（每文件全行 + 函数级耗时表，按行号排）。"""
+    """生成 LineProfiler 风格的文本汇总（每文件全行 + 函数级耗时表，按行号排）。
+
+    顶部加"线程总览"。文件/行/函数数据是**所有线程合并**视图。
+    """
     agg = profiler.aggregate()
     if not agg:
         return "[TimedLineProfiler] 没有收集到任何性能数据\n"
+
+    out: List[str] = []
+    sep = "=" * 100
+
+    # ---- 线程总览 ----
+    threads = profiler.list_threads()
+    if threads:
+        out.append(sep)
+        out.append(f"线程总览：共 {len(threads)} 个线程被 trace（数据为合并视图）")
+        out.append(sep)
+        for t in threads:
+            tid = t["tid"]
+            agg_t = profiler.aggregate(thread=tid)
+            t_total_ms = sum(_t for _t, _ in agg_t.values()) * 1000
+            t_hits = sum(c for _, c in agg_t.values())
+            t_lines = len(agg_t)
+            duration_ms = (t["last_seen_perf"] - t["first_seen_perf"]) * 1000
+            tag = " [main]" if t["is_main"] else ""
+            out.append(
+                f"  - {t['name']:30s} (tid={tid}){tag}  "
+                f"活跃 {duration_ms:9.2f} ms  "
+                f"命中行 {t_lines:4d}  命中次数 {t_hits:7d}  "
+                f"耗时 {t_total_ms:9.2f} ms"
+            )
+        out.append("")
 
     files_data: Dict[str, List[Tuple[int, float, int]]] = defaultdict(list)
     file_total: Dict[str, float] = defaultdict(float)
@@ -19,14 +47,12 @@ def render_text(profiler: TimedLineProfiler, threshold_ms: float = 0.0) -> str:
         files_data[fn].append((ln, t, c))
         file_total[fn] += t
 
-    # 函数级数据按文件分组
+    # 函数级数据按文件分组（合并视图）
     func_agg = profiler.aggregate_funcs()
     funcs_by_file: Dict[str, List[Tuple[str, int, float, int]]] = defaultdict(list)
     for (fn, fname, fl), (t, c) in func_agg.items():
         funcs_by_file[fn].append((fname, fl, t, c))
 
-    out: List[str] = []
-    sep = "=" * 100
     for fn in sorted(files_data):
         out.append(sep)
         out.append(f"文件: {fn}")

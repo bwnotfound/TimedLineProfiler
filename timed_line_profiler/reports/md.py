@@ -58,6 +58,32 @@ def render_markdown(
     lines.append(f"- 阈值过滤: 行总耗时 < {threshold_ms} ms 的不展示")
     lines.append("")
 
+    # ---- 线程总览（合并视图 + 各线程汇总）----
+    threads = profiler.list_threads()
+    if threads:
+        lines.append("## 线程总览")
+        lines.append("")
+        lines.append("_后续各表为**所有线程合并**视图。_")
+        lines.append("")
+        lines.append(
+            "| 线程 | tid | 主线程 | 活跃时段(ms) | 命中行数 | 命中次数 | 耗时(ms) | 占合并 |"
+        )
+        lines.append("|---|---:|:---:|---:|---:|---:|---:|---:|")
+        for t in threads:
+            tid = t["tid"]
+            agg_t = profiler.aggregate(thread=tid)
+            t_total_ms = sum(_t for _t, _ in agg_t.values()) * 1000
+            t_hits = sum(c for _, c in agg_t.values())
+            duration_ms = (t["last_seen_perf"] - t["first_seen_perf"]) * 1000
+            pct = t_total_ms / total_ms * 100 if total_ms else 0.0
+            main_tag = "✓" if t["is_main"] else ""
+            lines.append(
+                f"| `{t['name']}` | {tid} | {main_tag} | "
+                f"{duration_ms:.2f} | {len(agg_t)} | {t_hits} | "
+                f"{t_total_ms:.2f} | {pct:.1f}% |"
+            )
+        lines.append("")
+
     # ---- 各文件聚合（全行）----
     files_data: Dict[str, List[Tuple[int, float, int]]] = defaultdict(list)
     file_total: Dict[str, float] = defaultdict(float)

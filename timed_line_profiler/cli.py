@@ -137,6 +137,12 @@ def main():
         help="HTML dropdown 中列出所有文件视图（覆盖 --html-max-file-views）；"
         "文件多时 HTML 会很大，仅在确实需要时开启",
     )
+    parser.add_argument(
+        "--main-thread-only-trigger",
+        action="store_true",
+        help="只让主线程的 line 事件参与 trigger 计数（start-at / "
+        "stop-at / profile-hits）；默认任何线程命中都算",
+    )
     parser.add_argument("script", help="要执行的训练脚本")
     parser.add_argument(
         "script_args", nargs=argparse.REMAINDER, help="传给训练脚本的参数"
@@ -232,9 +238,10 @@ def main():
             lines_count = len(agg)
             total_hits = sum(c for _, c in agg.values())
             total_in_target_ms = sum(t for t, _ in agg.values()) * 1000
-            bucket_count = profiler.max_bucket + 1 if profiler.bucket_data else 0
+            bucket_count = profiler.max_bucket + 1 if profiler._thread_state else 0
             rec_dur = profiler.recording_duration
             rec_dur_str = f"{rec_dur*1000:.2f} ms" if rec_dur is not None else "未记录"
+            threads = profiler.list_threads()
 
             print("[TimedLineProfiler] 记录已结束，准备生成报告 ...", file=sys.stderr)
             print(f"  记录时长:     {rec_dur_str}", file=sys.stderr)
@@ -245,6 +252,10 @@ def main():
             print(
                 f"  时间窗口:     {bucket_count} 个 × {args.bucket} s", file=sys.stderr
             )
+            print(f"  涉及线程:     {len(threads)} 个", file=sys.stderr)
+            for t in threads:
+                tag = " [main]" if t["is_main"] else ""
+                print(f"    - {t['name']:30s} (tid={t['tid']}){tag}", file=sys.stderr)
             print("=" * 100, file=sys.stderr)
 
             text = render_text(profiler, threshold_ms=args.threshold_ms)
@@ -284,6 +295,7 @@ def main():
         profile_hits=args.profile_hits,
         max_duration=args.max_duration,
         on_stop_callback=finalize,  # stop 触发时立即写报告，不必等程序结束
+        main_thread_only_trigger=args.main_thread_only_trigger,
     )
     profiler_holder[0] = profiler
 
