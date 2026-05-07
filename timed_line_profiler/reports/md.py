@@ -56,20 +56,30 @@ def render_markdown(
     rec_dur_ms = rec_dur * 1000 if rec_dur is not None else 0.0
     main_agg = profiler.aggregate(thread="main")
     main_total_ms = sum(t for t, _ in main_agg.values()) * 1000
+    merged_wait_ms = sum(profiler.aggregate_wait().values()) * 1000
+    merged_work_ms = max(0.0, total_ms - merged_wait_ms)
+    main_wait_ms = sum(profiler.aggregate_wait(thread="main").values()) * 1000
+    main_work_ms = max(0.0, main_total_ms - main_wait_ms)
 
-    # ---- 概览：三个口径 ----
+    # ---- 概览：三个口径 + 工作/等待拆分 ----
     lines.append("## 概览")
     lines.append("")
     lines.append("**三个耗时口径**（含义不同，看清楚再判断优化目标）：")
     lines.append("")
+    lines.append(f"- **wall-clock 时长**: `{rec_dur_ms:.2f} ms` —— 程序真实流逝时间")
     lines.append(
-        f"- **wall-clock 时长**: `{rec_dur_ms:.2f} ms` —— 程序真实流逝时间（profiler.start → stop）"
+        f"- **主线程累加耗时**: `{main_total_ms:.2f} ms` "
+        f"= 工作 `{main_work_ms:.2f}` + 等待 `{main_wait_ms:.2f}`"
     )
     lines.append(
-        f"- **主线程累加耗时**: `{main_total_ms:.2f} ms` —— 仅主线程命中的行 sum"
+        f"- **合并累加耗时**: `{total_ms:.2f} ms` "
+        f"= 工作 `{merged_work_ms:.2f}` + 等待 `{merged_wait_ms:.2f}`"
     )
+    lines.append("")
     lines.append(
-        f"- **合并累加耗时**: `{total_ms:.2f} ms` —— 所有线程命中的行 sum（≈ wall-clock × 活跃线程数）"
+        '"等待" = 命中阻塞函数白名单的累计时间：`Queue.get/put` / `Event.wait` / '
+        "`Lock.acquire` / `Future.result` / `as_completed` / `selectors.select` 等。"
+        "`subprocess.run` 算工作（虽阻塞但有外部进程在干活）。"
     )
     lines.append("")
     lines.append(f"其它统计：")
@@ -92,7 +102,12 @@ def render_markdown(
             t_total = sum(_t for _t, _ in agg_t.values())
             t_hits = sum(c for _, c in agg_t.values())
             duration = t["last_seen_perf"] - t["first_seen_perf"]
+            wait_t = profiler.aggregate_wait(thread=t["tid"])
+            t_wait = sum(wait_t.values())
+            t_work = max(0.0, t_total - t_wait)
             t["_total_s"] = t_total
+            t["_work_s"] = t_work
+            t["_wait_s"] = t_wait
             t["_hits"] = t_hits
             t["_duration_s"] = duration
             t["_lines"] = len(agg_t)
@@ -100,30 +115,35 @@ def render_markdown(
             active_threads.append(t)
         else:
             silent_threads.append(t)
+    # 主线程优先 + 工作时间降序
+    active_threads.sort(key=lambda t: (not t["is_main"], -t["_work_s"]))
 
     if active_threads:
         lines.append("## 线程总览")
         lines.append("")
         lines.append(
-            f"_共 {len(active_threads)} 个有命中线程"
+            f"_共 {len(active_threads)} 个有命中线程（按工作时间降序）"
             + (
-                f"；另有 {len(silent_threads)} 个被注册但 0 hits 的线程已折叠到末尾_"
+                f"；另有 {len(silent_threads)} 个 0 hits 已折叠到末尾_"
                 if silent_threads
                 else "_"
             )
         )
         lines.append("")
         lines.append(
-            "| 线程 | 主 | 活跃率 | 活跃时段(ms) | 命中行 | 命中次数 | 耗时(ms) | 占合并 | hint |"
+            "| 线程 | 主 | 活跃率 | 活跃时段(ms) | 命中行 | 命中次数 | 工作(ms) | 等待(ms) | 占合并 | hint |"
         )
-        lines.append("|---|:---:|---:|---:|---:|---:|---:|---:|---|")
+        lines.append("|---|:---:|---:|---:|---:|---:|---:|---:|---:|---|")
         for t in active_threads:
             main_tag = "✓" if t["is_main"] else ""
             duration_ms = t["_duration_s"] * 1000
+            work_ms = t["_work_s"] * 1000
+            wait_ms = t["_wait_s"] * 1000
             t_total_ms = t["_total_s"] * 1000
             pct = t_total_ms / total_ms * 100 if total_ms else 0.0
+            # 活跃率改用工作时间
             if t["_duration_s"] > 0:
-                activity_pct = t["_total_s"] / t["_duration_s"] * 100
+                activity_pct = t["_work_s"] / t["_duration_s"] * 100
                 activity_str = f"{activity_pct:.1f}%"
             else:
                 activity_str = "—"
@@ -131,12 +151,12 @@ def render_markdown(
             lines.append(
                 f"| `{t['name']}` | {main_tag} | {activity_str} | "
                 f"{duration_ms:.2f} | {t['_lines']} | {t['_hits']} | "
-                f"{t_total_ms:.2f} | {pct:.1f}% | {alias_str} |"
+                f"{work_ms:.2f} | {wait_ms:.2f} | {pct:.1f}% | {alias_str} |"
             )
         lines.append("")
         lines.append(
-            "> **活跃率** = 累加耗时 / 活跃时段；>100% 不会出现（一个线程内同一时刻只跑一行），"
-            "<100% 表示该线程有 idle/wait 比例。**hint** 是该线程命中最多 hits 的函数名，仅供识别。"
+            "> **活跃率** = 工作时间 / 活跃时段。**hint** 是该线程命中最多 hits 的函数名，仅供识别。"
+            "若工作时间远小于总耗时，说明该线程主要在等。"
         )
         lines.append("")
 
@@ -146,6 +166,8 @@ def render_markdown(
     for (fn, ln), (t, c) in agg.items():
         files_data[fn].append((ln, t, c))
         file_total[fn] += t
+
+    wait_agg = profiler.aggregate_wait()
 
     lines.append("## 各文件聚合（合并视图，每文件全行）")
     lines.append("")
@@ -169,18 +191,20 @@ def render_markdown(
             continue
 
         lines.append(
-            "| 行 | 总耗时(ms) | 次数 | 平均(ms) | 文件内占比 | 全局占比 | 代码 |"
+            "| 行 | 工作(ms) | 等待(ms) | 次数 | 平均(ms) | 文件内占比 | 代码 |"
         )
         lines.append("|---:|---:|---:|---:|---:|---:|---|")
         for ln, t, c in kept:
             ms = t * 1000
+            wait_ms = wait_agg.get((fn, ln), 0.0) * 1000
+            work_ms = max(0.0, ms - wait_ms)
             avg = ms / c if c else 0.0
             file_pct = ms / f_total_ms * 100 if f_total_ms else 0.0
-            global_pct = ms / total_ms * 100 if total_ms else 0.0
+            wait_tag = "⏸ " if (wait_ms > 0 and wait_ms / ms > 0.5) else ""
             code = _esc(linecache.getline(fn, ln).strip())
             lines.append(
-                f"| {ln} | {ms:.2f} | {c} | {avg:.4f} | "
-                f"{file_pct:.1f}% | {global_pct:.1f}% | `{code}` |"
+                f"| {ln} | {work_ms:.2f} | {wait_ms:.2f} | {c} | {avg:.4f} | "
+                f"{file_pct:.1f}% | {wait_tag}`{code}` |"
             )
         lines.append("")
 
@@ -246,31 +270,52 @@ def render_markdown(
             alias = f" — `{t['_alias']}`" if t["_alias"] else ""
             lines.append(f"### `{t['name']}`{alias}")
             lines.append("")
-            lines.append(
-                f"耗时 **{t['_total_s']*1000:.2f} ms** · "
-                f"命中 {t['_hits']} 次 · "
-                f"活跃时段 {t['_duration_s']*1000:.2f} ms · "
-                f"活跃率 "
-                f"{(t['_total_s']/t['_duration_s']*100):.1f}%"
+            duration_ms = t["_duration_s"] * 1000
+            work_ms = t["_work_s"] * 1000
+            wait_ms = t["_wait_s"] * 1000
+            activity_str = (
+                f"{(t['_work_s']/t['_duration_s']*100):.1f}%"
                 if t["_duration_s"] > 0
-                else f"耗时 **{t['_total_s']*1000:.2f} ms** · " f"命中 {t['_hits']} 次"
+                else "—"
+            )
+            lines.append(
+                f"工作 **{work_ms:.2f} ms** · "
+                f"等待 **{wait_ms:.2f} ms** · "
+                f"命中 {t['_hits']} 次 · "
+                f"活跃时段 {duration_ms:.2f} ms · "
+                f"活跃率 {activity_str}"
             )
             lines.append("")
             agg_t = profiler.aggregate(thread=tid)
-            top_lines = sorted(agg_t.items(), key=lambda x: -x[1][0])[
-                :per_thread_top_lines
-            ]
+            wait_t = profiler.aggregate_wait(thread=tid)
+            # 按 工作时间 降序排
+            line_sorted = []
+            for (lfn, ln), (lt, lc) in agg_t.items():
+                ms = lt * 1000
+                w_ms = wait_t.get((lfn, ln), 0.0) * 1000
+                wk_ms = max(0.0, ms - w_ms)
+                line_sorted.append((lfn, ln, wk_ms, w_ms, lc))
+            line_sorted.sort(key=lambda x: -x[2])
+            top_lines = line_sorted[:per_thread_top_lines]
             if top_lines:
-                lines.append(f"**Top {len(top_lines)} 行：**")
+                lines.append(f"**Top {len(top_lines)} 行（按工作时间降序）：**")
                 lines.append("")
-                lines.append("| 文件:行 | 总耗时(ms) | 次数 | 平均(ms) | 代码 |")
+                lines.append("| 文件:行 | 工作(ms) | 等待(ms) | 次数 | 代码 |")
                 lines.append("|---|---:|---:|---:|---|")
-                for (lfn, ln), (lt, lc) in top_lines:
+                for lfn, ln, wk_ms, w_ms, lc in top_lines:
                     code = _esc(linecache.getline(lfn, ln).strip(), 80)
-                    avg = lt * 1000 / lc if lc else 0.0
+                    wait_tag = (
+                        "⏸ "
+                        if (
+                            w_ms > 0
+                            and (wk_ms + w_ms) > 0
+                            and w_ms / (wk_ms + w_ms) > 0.5
+                        )
+                        else ""
+                    )
                     lines.append(
-                        f"| `{os.path.basename(lfn)}:{ln}` | {lt*1000:.2f} | {lc} | "
-                        f"{avg:.4f} | `{code}` |"
+                        f"| `{os.path.basename(lfn)}:{ln}` | {wk_ms:.2f} | {w_ms:.2f} | "
+                        f"{lc} | {wait_tag}`{code}` |"
                     )
                 lines.append("")
             funcs_t = profiler.aggregate_funcs(thread=tid)

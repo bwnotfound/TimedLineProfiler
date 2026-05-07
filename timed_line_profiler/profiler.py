@@ -15,6 +15,47 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
+# ============================================================================
+# 阻塞函数白名单（基于 frame-level 识别，不是源码 regex）
+# 命中这些 callee 的样本：caller 行的耗时被分类为"等待"而非"工作"。
+# 匹配方式：(co_filename 路径后缀, co_name)；要求 path 含 'python'（stdlib 路径）。
+# 用户自己写的同名方法（如 class Foo: def get(self):）因 path 不含 'python' 自动排除。
+# ============================================================================
+_BLOCKING_FUNCS = frozenset(
+    [
+        # queue 模块（concurrent 多线程 队列）
+        ("queue.py", "get"),
+        ("queue.py", "put"),
+        # threading 模块（同步原语）
+        ("threading.py", "wait"),  # Event.wait / Condition.wait / Barrier.wait
+        ("threading.py", "wait_for"),  # Condition.wait_for
+        ("threading.py", "acquire"),  # Lock / RLock / Semaphore.acquire
+        # concurrent.futures
+        ("_base.py", "result"),  # Future.result
+        ("_base.py", "exception"),  # Future.exception
+        ("_base.py", "as_completed"),
+        ("_base.py", "wait"),  # concurrent.futures.wait
+        # selectors（asyncio / select 也走这条）
+        ("selectors.py", "select"),
+    ]
+)
+
+# subprocess.run / Popen.wait 等不在内 —— 按设计算工作（虽阻塞但有外部进程在干活）
+
+
+def _is_blocking_call(frame) -> bool:
+    """判断 frame 是否对应已知阻塞调用（基于 co_filename + co_name）。"""
+    fn = frame.f_code.co_filename
+    # 简单 stdlib 检测：路径含 'python'（如 /lib/python3.12/queue.py）
+    if "python" not in fn:
+        return False
+    name = frame.f_code.co_name
+    # 用最简后缀匹配；白名单很小，开销可忽略
+    for path_suffix, blocking_name in _BLOCKING_FUNCS:
+        if name == blocking_name and fn.endswith(path_suffix):
+            return True
+    return False
+
 
 class TimedLineProfiler:
     def __init__(
@@ -242,21 +283,69 @@ class TimedLineProfiler:
     def _global_trace(self, frame, event, arg):
         if event != "call":
             return None
+        # 优先检查阻塞调用：caller 行的 wait 时间累加由 _wait_trace 完成。
+        # 必须 caller 在 target 内（否则等待时间会被错算到 stdlib 内部）。
+        # 嵌套阻塞（Queue.get 内部调 Condition.wait）只算最外层。
+        if _is_blocking_call(frame):
+            caller = frame.f_back
+            if caller is not None:
+                caller_fn = self._fname_cache.get(caller.f_code.co_filename)
+                if caller_fn is not None:
+                    tid = threading.get_ident()
+                    state = self._thread_state.get(tid)
+                    if state is None:
+                        state = self._get_or_init_thread_state(tid)
+                    if state["_pending_blocking"] is None:
+                        state["_pending_blocking"] = (
+                            (caller_fn, caller.f_lineno),
+                            time.perf_counter(),
+                        )
+                        return self._wait_trace
+            # caller 不在 target、或已有更外层 pending：忽略
+            return None
+        # 非阻塞：原 target 文件检查 + 函数级入栈
         if self._resolve(frame.f_code.co_filename) is None:
             return None
         tid = threading.get_ident()
         state = self._thread_state.get(tid)
         if state is None:
             state = self._get_or_init_thread_state(tid)
-        # 入栈：(call_time, callee_acc=0)
-        # generator 每次 next()/send() 也触发 'call'，自然支持 yield 拆分计时。
-        # 这里同时识别 generator（co_flags & 0x20 == CO_GENERATOR），用于报告标 ⓖ。
         state["call_stack"].append([time.perf_counter(), 0.0])
         if frame.f_code.co_flags & 0x20:
             state["gen_funcs"].add(
                 (frame.f_code.co_filename, frame.f_code.co_firstlineno)
             )
         return self._local_trace
+
+    def _wait_trace(self, frame, event, arg):
+        """阻塞 frame 的轻量 trace：只在 return 时算 wait 累加。
+
+        line/exception events 直接返回 self（保持监听 return），不做任何工作 —— 阻塞
+        函数内部可能有大量 line events（Queue.get 调 Condition.wait 调 Lock.acquire），
+        我们不关心，只等最外层 return。
+        """
+        if event != "return":
+            return self._wait_trace
+        if not (self.recording and self.start_wall is not None):
+            return None
+        tid = threading.get_ident()
+        state = self._thread_state.get(tid)
+        if state is None:
+            return None
+        pending = state["_pending_blocking"]
+        state["_pending_blocking"] = None  # 清状态（即使 pending 是 None 也无害）
+        if pending is None:
+            return None
+        caller_line_key, call_time = pending
+        now = time.perf_counter()
+        # 用 max(call_time, start_wall) 裁剪到 recording 区间
+        effective_start = call_time if call_time > self.start_wall else self.start_wall
+        if now > effective_start:
+            state["wait_data"][caller_line_key] += now - effective_start
+        # 同时更新 last_seen
+        state["meta"]["last_seen_perf"] = now
+        state["meta"]["last_seen_wall"] = time.time()
+        return None
 
     def _local_trace(self, frame, event, arg):
         tid = threading.get_ident()
@@ -471,14 +560,17 @@ class TimedLineProfiler:
             "last_time": None,
             "bucket_data": defaultdict(lambda: defaultdict(lambda: [0.0, 0])),
             "func_bucket_data": defaultdict(lambda: defaultdict(lambda: [0.0, 0.0, 0])),
-            # per-thread 调用栈：[(call_time, callee_acc), ...]
-            # callee_acc 是该 frame 内已完成的子调用 cumulative 之和；
-            # frame return 时：self_time = (now - call_time) - callee_acc
-            # 然后把 elapsed 加到 caller (栈倒数第二) 的 callee_acc 上。
+            # per-thread 调用栈，self_time 计算用
             "call_stack": [],
-            # 函数 first_lineno -> is_generator (co_flags & 0x20)
-            # 用于报告里给 generator 标 ⓖ。第一次见到该函数时记录。
+            # generator 函数集合（co_flags & 0x20）
             "gen_funcs": set(),
+            # 阻塞计时：{(file, line): total_wait_seconds}
+            # 当 caller 行调用了已知阻塞函数（Queue.get / Event.wait / ...）时，
+            # 把那段阻塞 elapsed 累到这里。报告时用 "工作 = 总耗时 - wait" 拆分。
+            "wait_data": defaultdict(float),
+            # 当前是否有进行中的阻塞调用：(caller_line_key, call_perf_time) or None
+            # 嵌套阻塞（如 Queue.get 内部调 Condition.wait）只算最外层。
+            "_pending_blocking": None,
             "meta": {
                 "name": tname,
                 "is_main": (tid == self._main_thread_id),
@@ -627,14 +719,30 @@ class TimedLineProfiler:
 
         信息来自 'call' 事件时的 frame.f_code.co_flags 检查，跨所有线程合并。
         """
-        # gen_funcs 在 state 里按 co_filename 存（可能与 _resolve 后的 fn 不同）
-        # 简单匹配：任一线程见过该 (resolved fn, lineno) 即认为是 generator
         for state in self._thread_state.values():
             for raw_fn, fl in state.get("gen_funcs", ()):
                 resolved = self._fname_cache.get(raw_fn)
                 if resolved == fn and fl == first_lineno:
                     return True
         return False
+
+    def aggregate_wait(self, thread=None) -> Dict[Tuple[str, int], float]:
+        """聚合每行的"等待"时长（秒），即 caller 阻塞在已知阻塞函数（Queue.get /
+        Event.wait 等）的累计时间。
+
+        thread 参数语义同 aggregate()。
+
+        实际"工作"时间 = aggregate()[k][0] - aggregate_wait()[k]，永远 ≥ 0。
+        """
+        cache_key = ("wait", thread)
+        if cache_key in self._agg_caches:
+            return self._agg_caches[cache_key]
+        out: Dict[Tuple[str, int], float] = defaultdict(float)
+        for tid in self._resolve_thread_filter(thread):
+            for k, v in self._thread_state[tid].get("wait_data", {}).items():
+                out[k] += v
+        self._agg_caches[cache_key] = out
+        return out
 
     def _build_inverted(
         self, thread=None
