@@ -70,13 +70,23 @@ tlprof \
 
 支持的 glob 语法：`*`（不跨 `/`）、`**`（跨多层）、`?`、`[...]`、`[!...]`。
 
+`--target` / `--exclude` / `--exclude-from` 都支持**逗号分隔**多个值，与重复 flag 等价：
+
+```bash
+# 这两条命令完全等价
+tlprof --target 'mymodel/**/*.py,torch/nn/modules/linear.py' --out ./rep -- train.py
+tlprof --target 'mymodel/**/*.py' --target 'torch/nn/modules/linear.py' --out ./rep -- train.py
+```
+
+> ⚠️ 不支持文件名含 `,`（极罕见）；前后空格会被自动 strip，空项被忽略。
+
 > ⚠️ "FS 命中优先" 意味着：cwd 下 FS 已能匹配的模式不会再 fallback 到相对模式。
 > 这避免了 `**/*.py` 这类宽泛模式作为相对模式时误伤整个文件系统的所有 `.py`。
 
 ## `--exclude` / `--exclude-from`
 
-- `--exclude PATTERN`：排除文件，与 `--target` 同 glob 语法，可重复
-- `--exclude-from FILE`：从 gitignore 风格文件读取（每行一个模式），可重复
+- `--exclude PATTERN`：排除文件，与 `--target` 同 glob 语法；可重复，单个内可用逗号分隔
+- `--exclude-from FILE`：从 gitignore 风格文件读取（每行一个模式）；可重复，单个内可用逗号分隔多个文件路径
 - exclude 优先级 > target，命中即不追踪
 
 ```bash
@@ -108,18 +118,42 @@ tlprof --target 'src/**/*.py' \
 | `**/*.py` | 标准 glob                                        |
 | `!foo`    | **不支持**否定语法，会跳过该规则并 warn          |
 
-## `--start-at` / `--stop-at`
+## `--start-at` / `--stop-at` / `--profile-hits` / `--max-duration`
 
-trigger 的 file 部分同样支持 FS 路径与相对路径模式：
+四个参数共同控制"什么时候开始/停止记录"。
+
+**开始**：
+
+- `--start-at FILE:LINE[:N]`：当 FILE 第 LINE 行被命中第 N 次时开始记录；N 缺省为 1（首次命中即开始）。FILE 同样支持 glob/相对路径。
+- 不指定 `--start-at` → 程序一启动就记录。
+
+**停止**（以下三者**任一先达到**就停止，OR 关系，与口语"取 min"等价）：
+
+- `--stop-at FILE:LINE[:M]`：FILE 第 LINE 行被命中第 M 次时停止；M 缺省 1（绝对计数，从程序启动起算）。
+- `--profile-hits M`：开始记录后，**`--start-at` 那行**被再命中 M 次时停止（相对 start 计数）。需配合 `--start-at` 使用。
+- `--max-duration SEC`：开始记录后最多 SEC 秒就停止。
+
+举例："profile 主循环 100 步" 是常见需求：
+
+```bash
+tlprof --target 'mymodel/**/*.py' \
+    --start-at 'mymodel/trainer/loop.py:120' \
+    --profile-hits 100 \
+    --out ./rep -- train.py
+```
+
+举例："warmup 5 步后 profile 100 步，但最多 30 秒"：
 
 ```bash
 tlprof --target 'mymodel/**/*.py' \
     --start-at 'mymodel/trainer/loop.py:120:5' \
-    --stop-at  'mymodel/trainer/loop.py:120:105' \
+    --profile-hits 100 --max-duration 30 \
     --out ./rep -- train.py
 ```
 
-> ⚠️ 当 trigger 的 file 模式命中**多个文件**时，"第 N 次"命中是**全局累加**（跨文件计数）。要精确触发，请用具体单文件路径。
+> ⚠️ 当 `--start-at` / `--stop-at` / `--profile-hits` 涉及的 file 模式命中**多个文件**时，"第 N 次"是**全局累加**（跨文件计数）。要精确触发，请用具体单文件路径。
+
+> ⚠️ stop 之后 `--start-at` **不会再次触发**（防止 stop → start → stop 反复跳转）。如果你的 trigger 行就是循环体内某行，这一点尤其重要。
 
 ## 选行规则：每文件 `max(top-k, ratio 触发数)`
 
@@ -170,7 +204,7 @@ tlprof \
     --bucket 5.0 \
     --top-k 10 --top-ratio 1.0 \
     --start-at trainer/loop.py:120:5 \
-    --stop-at  trainer/loop.py:120:105 \
+    --profile-hits 100 --max-duration 60 \
     --cuda-sync \
     --out ./report_dir \
     -- trainer/loop.py --epochs 100
@@ -228,19 +262,21 @@ timed_line_profiler/
 
 ## 关键参数速查
 
-| 参数                     | 说明                                                       |
-| ------------------------ | ---------------------------------------------------------- |
-| `--target`               | 目标文件，可重复；FS glob 优先 + 相对路径模式兜底          |
-| `--exclude`              | 排除文件 glob，可重复                                      |
-| `--exclude-from`         | gitignore 风格排除规则文件，可重复                         |
-| `--bucket`               | 时间窗口大小（秒）                                         |
-| `--start-at FILE:LINE:N` | 该行命中第 N 次时开始记录                                  |
-| `--stop-at FILE:LINE:M`  | 该行命中第 M 次时停止记录                                  |
-| `--cuda-sync`            | 每个目标行后调 `torch.cuda.synchronize()`                  |
-| `--out`                  | 输出目录（不存在时自动创建），生成 report.html + report.md |
-| `--top-k`                | 每个文件至少选 k 行（默认 10）                             |
-| `--top-ratio PCT`        | 占文件总耗时 ≥ PCT% 的行也选上，与 top-k 取并集（默认 0）  |
-| `--threshold-ms`         | 报告中过滤总耗时低于该值的行                               |
+| 参数                       | 说明                                                                  |
+| -------------------------- | --------------------------------------------------------------------- |
+| `--target`                 | 目标文件；可重复，单个内可用逗号分隔；FS glob 优先 + 相对路径模式兜底 |
+| `--exclude`                | 排除文件 glob；可重复，单个内可用逗号分隔                             |
+| `--exclude-from`           | gitignore 风格排除规则文件；可重复，单个内可用逗号分隔                |
+| `--bucket`                 | 时间窗口大小（秒）                                                    |
+| `--start-at FILE:LINE[:N]` | 该行命中第 N 次时开始记录（N 默认 1）                                 |
+| `--stop-at FILE:LINE[:M]`  | 该行命中第 M 次时停止记录（M 默认 1，绝对计数）                       |
+| `--profile-hits M`         | 开始记录后 --start-at 那行再命中 M 次后停止（相对计数）               |
+| `--max-duration SEC`       | 开始记录后最多 SEC 秒就停止；与上述 stop 条件 OR 关系                 |
+| `--cuda-sync`              | 每个目标行后调 `torch.cuda.synchronize()`                             |
+| `--out`                    | 输出目录（不存在时自动创建），生成 report.html + report.md            |
+| `--top-k`                  | 每个文件至少选 k 行（默认 10）                                        |
+| `--top-ratio PCT`          | 占文件总耗时 ≥ PCT% 的行也选上，与 top-k 取并集（默认 0）             |
+| `--threshold-ms`           | 报告中过滤总耗时低于该值的行                                          |
 
 ## 已知局限
 
@@ -248,7 +284,8 @@ timed_line_profiler/
 - `sys.settrace` 自带 5–30x slowdown；`--cuda-sync` 会进一步串行化 CPU/GPU
 - 与 `pdb` / `debugpy` 等同样使用 `sys.settrace` 的工具不能并存
 - DDP 多 rank 训练时，每个 rank 都会写报告，请加 RANK 区分输出目录
-- 当 `--start-at`/`--stop-at` 的 file 模式命中多文件时，"第 N 次"是跨文件累加
+- 当 `--start-at`/`--stop-at`/`--profile-hits` 的 file 模式命中多文件时，"第 N 次"是跨文件累加
+- stop 之后 `--start-at` 不会再次触发（防止反复跳转）
 - `--exclude-from` 不支持 gitignore 的 `!` 否定语法（会跳过并 warn）
 
 ## License

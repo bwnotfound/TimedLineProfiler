@@ -24,6 +24,8 @@ class TimedLineProfiler:
         cuda_sync: bool = False,
         target_patterns: Optional[List[Tuple[str, "re.Pattern"]]] = None,
         exclude_patterns: Optional[List[Tuple[str, "re.Pattern"]]] = None,
+        profile_hits: Optional[int] = None,
+        max_duration: Optional[float] = None,
     ):
         self.target_files: Set[str] = set(target_files)
         self.target_patterns: List[Tuple[str, "re.Pattern"]] = list(
@@ -35,8 +37,12 @@ class TimedLineProfiler:
         self.bucket_seconds = bucket_seconds
         self.start_trigger = start_trigger
         self.stop_trigger = stop_trigger
+        self.profile_hits = profile_hits
+        self.max_duration = max_duration
         self.start_hit = 0
         self.stop_hit = 0
+        self._profile_hits_count = 0
+        self._start_consumed = False  # start trigger 是否已触发过（防止 stop 后被重启）
         self.recording = start_trigger is None
 
         self.bucket_data: Dict[int, Dict[Tuple[str, int], List]] = defaultdict(
@@ -157,14 +163,17 @@ class TimedLineProfiler:
         key = (fn, lineno)
 
         if not self.recording:
-            if self.start_trigger is not None and self._trigger_match(
-                self.start_trigger, fn, lineno
+            if (
+                self.start_trigger is not None
+                and not self._start_consumed
+                and self._trigger_match(self.start_trigger, fn, lineno)
             ):
                 self.start_hit += 1
                 if self.start_hit >= self.start_trigger[2]:
                     if self._cuda_sync_fn is not None:
                         self._cuda_sync_fn()
                     self.recording = True
+                    self._start_consumed = True
                     self.start_wall = time.perf_counter()
                     self.last_line = None
                     self.last_time = self.start_wall
@@ -204,6 +213,39 @@ class TimedLineProfiler:
                     f"[info] 触发停止记录: {fn}:{lineno} 第 {self.stop_hit} 次",
                     file=sys.stderr,
                 )
+                return self._local_trace
+
+        # profile_hits：开始记录后再命中 start trigger 那行 N 次
+        if (
+            self.profile_hits is not None
+            and self.start_trigger is not None
+            and self._trigger_match(self.start_trigger, fn, lineno)
+        ):
+            self._profile_hits_count += 1
+            if self._profile_hits_count >= self.profile_hits:
+                self.recording = False
+                self.last_line = None
+                print(
+                    f"[info] 触发停止记录: --profile-hits 达到 "
+                    f"{self._profile_hits_count} 次",
+                    file=sys.stderr,
+                )
+                return self._local_trace
+
+        # max_duration：开始记录后限时
+        if (
+            self.max_duration is not None
+            and self.start_wall is not None
+            and now - self.start_wall >= self.max_duration
+        ):
+            self.recording = False
+            self.last_line = None
+            print(
+                f"[info] 触发停止记录: --max-duration {self.max_duration}s 到时 "
+                f"(实际 {now - self.start_wall:.3f}s)",
+                file=sys.stderr,
+            )
+            return self._local_trace
 
         return self._local_trace
 

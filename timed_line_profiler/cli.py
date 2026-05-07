@@ -15,6 +15,21 @@ from .profiler import TimedLineProfiler
 from .reports import render_html, render_markdown, render_text
 
 
+def _split_csv(values):
+    """把 List[str] 中每项按逗号 split，flatten 后 strip + 去空。
+
+    让 ``--target 'a,b'`` 等价于 ``--target a --target b``；两种形式可混用。
+    不支持含逗号的文件名。
+    """
+    out = []
+    for v in values or []:
+        for item in v.split(","):
+            item = item.strip()
+            if item:
+                out.append(item)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Line-level time profiler with bucketed time windows.",
@@ -25,20 +40,22 @@ def main():
         action="append",
         required=True,
         help='要追踪的文件，支持 FS glob 与"相对路径 glob"两种语义；'
-        '可重复指定。例如 "model/**/*.py"、'
-        '"pandas/core/frame.py"、"torch/nn/modules/*.py"',
+        "可重复指定，单个 --target 内也可用逗号分隔多个。"
+        '例如 "model/**/*.py,trainer/loop.py"',
     )
     parser.add_argument(
         "--exclude",
         action="append",
         default=[],
-        help="排除文件的模式（与 --target 同 glob 语法）；可重复",
+        help="排除文件的模式（与 --target 同 glob 语法）；"
+        "可重复，单个内可用逗号分隔",
     )
     parser.add_argument(
         "--exclude-from",
         action="append",
         default=[],
-        help="从 gitignore 风格文件读取排除规则；可重复。"
+        help="从 gitignore 风格文件读取排除规则；"
+        "可重复，单个内可用逗号分隔多个文件路径。"
         "不支持 ! 否定语法（会跳过并 warn）",
     )
     parser.add_argument(
@@ -47,16 +64,33 @@ def main():
     parser.add_argument(
         "--start-at",
         default=None,
-        metavar="FILE:LINE:N",
+        metavar="FILE:LINE[:N]",
         help="当 FILE 第 LINE 行被命中第 N 次时开始记录；"
+        "N 默认 1（首次命中即开始）。"
         "FILE 同样支持 glob/相对路径",
     )
     parser.add_argument(
         "--stop-at",
         default=None,
-        metavar="FILE:LINE:M",
+        metavar="FILE:LINE[:M]",
         help="当 FILE 第 LINE 行被命中第 M 次时停止记录；"
-        "FILE 同样支持 glob/相对路径",
+        "M 默认 1。FILE 同样支持 glob/相对路径",
+    )
+    parser.add_argument(
+        "--profile-hits",
+        type=int,
+        default=None,
+        metavar="M",
+        help="开始记录后，--start-at 那行被再命中 M 次时停止；"
+        "需配合 --start-at 使用",
+    )
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="开始记录后最多运行 SEC 秒就停止；"
+        "与 --profile-hits / --stop-at 同时指定时取先到先停（OR）",
     )
     parser.add_argument(
         "--cuda-sync",
@@ -94,6 +128,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # 把可重复参数里的逗号分隔形式 flatten 出来
+    args.target = _split_csv(args.target)
+    args.exclude = _split_csv(args.exclude)
+    args.exclude_from = _split_csv(args.exclude_from)
 
     # ---- 输出目录预检查 / 自动创建 ----
     if os.path.exists(args.out):
@@ -138,6 +177,26 @@ def main():
     start_trig = parse_trigger(args.start_at)
     stop_trig = parse_trigger(args.stop_at)
 
+    if args.profile_hits is not None and start_trig is None:
+        print(
+            "[error] --profile-hits 需要配合 --start-at 使用（要靠 start trigger "
+            "那行定位计数对象）",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.profile_hits is not None and args.profile_hits <= 0:
+        print(
+            f"[error] --profile-hits 必须为正整数，实际收到: {args.profile_hits}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.max_duration is not None and args.max_duration <= 0:
+        print(
+            f"[error] --max-duration 必须为正数，实际收到: {args.max_duration}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     profiler = TimedLineProfiler(
         target_files=abs_targets,
         bucket_seconds=args.bucket,
@@ -146,6 +205,8 @@ def main():
         cuda_sync=args.cuda_sync,
         target_patterns=rel_patterns,
         exclude_patterns=excludes,
+        profile_hits=args.profile_hits,
+        max_duration=args.max_duration,
     )
 
     finalize_done = [False]

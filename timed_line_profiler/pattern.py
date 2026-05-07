@@ -164,20 +164,30 @@ def resolve_excludes(
 
 
 def parse_trigger(spec: Optional[str]) -> Optional[Tuple["re.Pattern", int, int]]:
-    """解析 'file_spec:line:n'，file_spec 支持具体文件 / glob / 相对路径模式。
+    """解析 'FILE:LINE' 或 'FILE:LINE:N'，N 缺省为 1。
 
+    file_spec 支持具体文件 / glob / 相对路径模式。
     返回 (regex, line, n)。具体文件存在 -> 编译为该 abs path 的精确尾匹配 regex；
     否则 -> glob_to_regex。
     """
     if spec is None:
         return None
-    parts = spec.rsplit(":", 2)
-    if len(parts) != 3:
-        raise ValueError(f"trigger 格式应为 FILE:LINE:N，实际收到: {spec}")
-    fn, ln, n = parts
+    # 优先尝试 FILE:LINE:N（最后两段都是纯数字）
+    parts3 = spec.rsplit(":", 2)
+    if len(parts3) == 3 and parts3[1].isdigit() and parts3[2].isdigit():
+        fn, ln_s, n_s = parts3
+        ln, n = int(ln_s), int(n_s)
+    else:
+        # 退而 FILE:LINE，N 默认 1
+        parts2 = spec.rsplit(":", 1)
+        if len(parts2) != 2 or not parts2[1].isdigit():
+            raise ValueError(
+                f"trigger 格式应为 FILE:LINE 或 FILE:LINE:N，实际收到: {spec}"
+            )
+        fn, ln, n = parts2[0], int(parts2[1]), 1
     if os.path.exists(fn):
         abs_norm = os.path.abspath(fn).replace(os.sep, "/")
         regex = re.compile(r"(?:^|/)" + re.escape(abs_norm.lstrip("/")) + "$")
     else:
         regex = glob_to_regex(fn)
-    return (regex, int(ln), int(n))
+    return (regex, ln, n)
