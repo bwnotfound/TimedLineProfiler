@@ -15,8 +15,9 @@
 | **每文件 top-k + ratio 并集选行**                  | ❌             | ✅                   |
 | HTML 可视化（含 log scale 自适应 + 文件 dropdown） | ❌             | ✅                   |
 | Markdown 完整聚合报告                              | ❌             | ✅                   |
-| **函数级耗时（含 yield 正确处理）**                | ❌             | ✅                   |
-| **多线程支持（per-thread 数据）**                  | ❌             | ✅                   |
+| **函数级耗时（self / cumul 双口径，generator ⓖ）** | ❌             | ✅                   |
+| **多线程支持（per-thread 数据 + 下钻 + 活跃率）**  | ❌             | ✅                   |
+| **三口径总耗时（wall-clock / 主线程 / 合并累加）** | ❌             | ✅                   |
 
 ## 安装
 
@@ -270,9 +271,14 @@ render_markdown(profiler, "rep/report.md", top_k=10, top_ratio_pct=1.0)
 # 下钻到单个线程：
 for t in profiler.list_threads():
     agg_t = profiler.aggregate(thread=t['tid'])
-    funcs_t = profiler.aggregate_funcs(thread=t['tid'])
+    funcs_t = profiler.aggregate_funcs(thread=t['tid'])  # 返回 {key: [cumul_s, self_s, count]}
     total_ms = sum(_t for _t, _ in agg_t.values()) * 1000
     print(f"{t['name']:20s} {total_ms:8.2f} ms  {len(agg_t)} 行")
+    # 该线程内的 top-3 函数（按 self 降序）
+    top = sorted(funcs_t.items(), key=lambda x: -x[1][1])[:3]
+    for (fn, fname, fl), (cumul, self_t, cnt) in top:
+        gen = "ⓖ" if profiler.is_generator_func(fn, fl) else " "
+        print(f"  {gen} {fname:20s}  self={self_t*1000:7.2f} ms  cumul={cumul*1000:7.2f} ms  ×{cnt}")
 ```
 
 ## 模块结构
@@ -312,6 +318,8 @@ timed_line_profiler/
 | `--html-max-file-views N`    | HTML dropdown 中最多列出 top-N 个单文件视图（默认 8）                 |
 | `--html-all-files`           | HTML dropdown 列出全部文件（覆盖 max-file-views，HTML 会变大）        |
 | `--main-thread-only-trigger` | 只让主线程参与 trigger 计数；默认任意线程命中都算                     |
+| `--per-thread-top-lines N`   | 每个有命中的子线程下钻展示 top-N 行（默认 10）                        |
+| `--per-thread-top-funcs N`   | 每个有命中的子线程下钻展示 top-N 函数（默认 5）                       |
 
 ## 异常退出与崩溃排查
 
@@ -334,31 +342,59 @@ profiler 尽力在程序异常退出时仍输出已采集到的数据：
 - 同样崩溃 → 与 profiler 无关，是训练环境本身的兼容性问题（lightning vs torch 版本、optimizer state 类型等），需要在不带 profiler 的环境里先解决
 - 仅 tlprof 下崩溃 → 是 profiler 的 trace 干扰，请提交 issue 并附上完整 traceback
 
-## 函数级耗时统计
+## 函数级耗时统计：self vs cumulative
 
-除了行级数据，每份报告（text / md）的每个文件后会列出该文件中**所有函数的总耗时**。
+每个文件下面会列出该文件中所有函数的耗时表，**两个时间口径**：
 
-- **总耗时含子调用**：与 cProfile 的 cumulative time 一致——`A` 调用 `B`，`A` 的耗时含 `B` 的全部时间
-- **generator / yield 自动正确处理**：`sys.settrace` 把 yield 视为一次 return（值带在 arg 里），下次 `next()` 时再触发 call。两段时间分别累加，**yield 之间消费者的等待时间不会被计入 generator**
-- `call_count` 是函数被进入的次数。注意 generator 函数：**创建 generator 对象本身**也算一次 call/return（耗时近 0），所以 `call_count = 1（创建）+ N（实际 next() 次数）`
-- 数据生成机制：在 `'call'` 事件记录 frame 进入时间，`'return'` 事件累加 `now - max(call_time, recording_start)` 到该函数
+| 口径         | 含义                                                                 | 报告里列名  |
+| ------------ | -------------------------------------------------------------------- | ----------- |
+| `self`       | 函数自己代码的耗时（**不含**子调用）                                 | `self(ms)`  |
+| `cumulative` | call → return 总时长（**含**子调用，与 cProfile 的 cumulative 一致） | `cumul(ms)` |
 
-例子（已在 `examples/` 中给出）：caller 在 yield 之间 sleep 1.5s 不会被算到 generator 函数上，generator 仅记录它自己 yield 段的真实工作时间。
+实现：profiler 内部维护 per-thread 调用栈，frame return 时 `self = cumulative - sum(子调用 cumulative)`，自动减掉嵌套子调用的开销。
+
+### 为什么要两个口径
+
+只看 cumulative 容易被误导。比如 `_iter_batches` 是 generator，调子 generator + 自己做点工作：
+
+```python
+def _iter_batches():
+    for x in sub_gen():        # 调子 generator，工作 25 ms（在子文件内）
+        time.sleep(0.001)      # 自己工作 1 ms
+        yield x
+```
+
+| 口径     | _iter_batches                            |
+| -------- | ---------------------------------------- |
+| cumul    | 31 ms（含 sub_gen 的 25ms + 自己的 5ms） |
+| **self** | **5 ms**（仅自己的 5ms）                 |
+
+报告里"占文件比"用 self 算，所以**永远 ≤ 100%**。早期版本用 cumul 算占比会出现 868% 这种数（含跨文件子调用累加）。
+
+### Generator（ⓖ）
+
+`sys.settrace` 把 yield 视为一次 return（值带在 arg 里），下次 `next()` 触发新的 call。两段时间分别累加，**yield 之间消费者的等待时间不会被计入 generator**——这是正确的行为。
+
+报告里 generator 函数前缀 `ⓖ` 标识（依据 `co_flags & 0x20`）。
+
+`进入次数` 列的语义：generator 每次 next()/send() 都算一次进入；`g = my_gen()` 创建对象本身也算一次（耗时近 0），所以 `进入次数 = 1（创建）+ N（实际 next 次数）`。
 
 ## 多线程支持
 
-Python 同进程内的子线程（`threading.Thread` / `ThreadPoolExecutor`）会被自动 trace。每个线程的数据独立采集（**无锁**——每个线程只写自己的 dict），最后报告里既可以看合并视图，也可以下钻到单个线程。
+Python 同进程内的子线程（`threading.Thread` / `ThreadPoolExecutor`）会被自动 trace。每个线程的数据独立采集（**无锁**——每个线程只写自己的 dict），报告既给合并视图也给单线程下钻。
 
 ### 工作机制
 
-`profiler.start()` 调用 `threading.settrace(_global_trace)`——这之后**新创建**的所有 Python 线程会自动被 trace。已存在的线程不受影响（但启动 profiler 时通常只有主线程，所以无所谓）。
+`profiler.start()` 调用 `threading.settrace(_global_trace)`——这之后**新创建**的所有 Python 线程会自动被 trace。已存在的线程不受影响（但启动 profiler 时通常只有主线程）。
 
-数据结构：
+数据结构（每条数据 thread_id 独立，互不踩）：
 
 ```python
 profiler._thread_state[tid] = {
-    'last_line', 'last_time',           # per-thread 状态，互不干扰
+    'last_line', 'last_time',           # per-thread 状态
     'bucket_data', 'func_bucket_data',  # per-thread 累加
+    'call_stack',                       # per-thread 调用栈，用于算 self_time
+    'gen_funcs',                        # 该线程见过的 generator 函数
     'meta': {
         'name', 'is_main', 'order',
         'first_seen_perf', 'first_seen_wall',  # 相对+绝对时间戳
@@ -367,41 +403,70 @@ profiler._thread_state[tid] = {
 }
 ```
 
-每条数据的 thread_id 始终独立，互相不踩。
+### 三个耗时口径
 
-### 报告呈现
+报告头部列出**含义不同的三个数**，看清楚再判断优化目标：
 
-text / md 报告：
+| 口径                | 含义                                              |
+| ------------------- | ------------------------------------------------- |
+| **wall-clock 时长** | 程序真实流逝时间（profiler.start → stop）         |
+| **主线程累加耗时**  | 仅主线程命中行的 sum                              |
+| **合并累加耗时**    | 所有线程命中行的 sum（≈ wall-clock × 活跃线程数） |
 
-- 顶部"线程总览"列出每个线程的活跃时段、命中行数、命中次数、耗时
-- 文件/行/函数表是**合并视图**（所有线程数据加在一起）
+只有"合并累加"通常远超 wall-clock；这是正常的（多线程并发执行各自的代码累加起来超过流逝时间）。
 
-下钻到单线程的代码 API：
+### 线程总览
+
+报告里"线程总览"小节展示每个线程的：
+
+- **活跃率** = `累加耗时 / 活跃时段`，0~100%。一眼看出该线程是 busy 还是常 idle/wait
+- **活跃时段** = `last_seen - first_seen`（perf_counter 跨度）
+- **hint** = 该线程命中最多 hits 的函数名，自动推断出来作为业务标识。比如 `ThreadPoolExecutor-1_8` 会自动显示 `[_iter_with_prefetch.worker]`，无需手动 alias
+
+被注册但 0 hits 的线程（worker pool 里创建后没跑过 target 代码的）会折叠到附录，不污染主表。
+
+### 每线程下钻
+
+text / md 报告的"每线程下钻"小节对每个有命中的子线程展示：
+
+- Top-N 行（默认 10，`--per-thread-top-lines` 配置）
+- Top-N 函数（默认 5，`--per-thread-top-funcs` 配置）
+
+主线程的数据已是合并视图的主体，不重复展示。
+
+### Trigger 在多线程下的语义
+
+- **默认**：start-at / stop-at / profile-hits 的"N 次命中"是**任何线程命中都算**（profiler-wide 计数）
+- **`--main-thread-only-trigger`**：只主线程命中才算。常用场景：精确控制 profile 主循环的第 N 步，避免 worker 线程干扰计数
+
+无论选哪种，trigger 一旦触发，**所有线程**都进入 recording 状态。
+
+### 通过 Python API 下钻
 
 ```python
-# 通过 Python API（不用 cli），可以拿任意线程的独立数据：
+# 任意线程的独立数据
 agg_main = profiler.aggregate(thread='main')        # 仅主线程
 agg_t    = profiler.aggregate(thread=tid)           # 指定线程
 agg_all  = profiler.aggregate()                     # 合并（默认）
 
-func_main = profiler.aggregate_funcs(thread='main')
-threads   = profiler.list_threads()                 # 所有线程的 meta 信息
+# 函数级（返回 [cumulative_s, self_s, count]）
+funcs = profiler.aggregate_funcs(thread='main')
+for (fn, fname, fl), (cumul, self_t, cnt) in funcs.items():
+    is_gen = profiler.is_generator_func(fn, fl)
+    print(f"{fname}{'ⓖ' if is_gen else ''}: self={self_t*1000:.2f}ms cumul={cumul*1000:.2f}ms x{cnt}")
+
+# 线程列表（含 meta：name/is_main/first_seen/last_seen 等）
+for t in profiler.list_threads():
+    print(t['name'], t['tid'], t['is_main'])
 ```
 
-> HTML 报告中的分线程下钻（dropdown 切换）和时间轴可视化（gantt-style 显示每线程的活跃区间，支持相对/绝对时间 toggle）将在后续版本中加入。
-
-### Trigger 在多线程下的语义
-
-- **默认**：start-at / stop-at / profile-hits 的 "N 次命中" 是**任何线程命中都算**（profiler-wide 计数）
-- **`--main-thread-only-trigger`**：只主线程命中才算。常用场景：你想精确控制 profile 主循环的第 N 步，避免 worker 线程干扰计数
-
-无论选哪种，trigger 一旦触发，**所有线程**都进入 recording 状态（recording 是 profiler 全局状态）。
+> HTML 报告中的分线程 dropdown 切换 + 时间轴 subplot 将在后续版本中加入。
 
 ### 边界
 
-- **子进程不被支持**（如 PyTorch DataLoader workers / multiprocessing）。`sys.settrace` / `threading.settrace` 都跨不过进程边界。如果你的工作负载主要在子进程里，profiler 看不到
-- **C 扩展直接起的线程**（如 NumPy 内部的某些 OpenMP 池）也不受 `threading.settrace` 影响——只有用 Python `threading` 模块创建的线程会被 hook
-- **trace 已经存在的线程**没法注入。但 profiler 一般在 main 入口启动，那时候只有主线程
+- **子进程不被支持**（DataLoader workers / multiprocessing / DDP 不同 rank）。`sys.settrace` / `threading.settrace` 都跨不过进程边界
+- **C 扩展直接起的线程**（如 NumPy 内部的某些 OpenMP 池）不受 `threading.settrace` 影响——只有用 Python `threading` 模块创建的线程会被 hook
+- **profiler 启动前已存在的线程**没法注入。但 profiler 一般在 main 入口启动，那时候只有主线程
 
 ## 已知局限
 

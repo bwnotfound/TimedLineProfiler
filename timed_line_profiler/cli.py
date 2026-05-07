@@ -143,6 +143,18 @@ def main():
         help="只让主线程的 line 事件参与 trigger 计数（start-at / "
         "stop-at / profile-hits）；默认任何线程命中都算",
     )
+    parser.add_argument(
+        "--per-thread-top-lines",
+        type=int,
+        default=10,
+        help="每个有命中的子线程展示 top-N 行（默认 10）",
+    )
+    parser.add_argument(
+        "--per-thread-top-funcs",
+        type=int,
+        default=5,
+        help="每个有命中的子线程展示 top-N 函数（默认 5）",
+    )
     parser.add_argument("script", help="要执行的训练脚本")
     parser.add_argument(
         "script_args", nargs=argparse.REMAINDER, help="传给训练脚本的参数"
@@ -232,33 +244,56 @@ def main():
             profiler.stop()
         finally:
             print("\n" + "=" * 100, file=sys.stderr)
-            # 记录汇总：在写入报告前打印，让用户能立即看到记录结果概况
-            agg = profiler.aggregate()  # 已缓存，几乎零开销
+            agg = profiler.aggregate()
             files_count = len({fn for fn, _ in agg.keys()})
             lines_count = len(agg)
             total_hits = sum(c for _, c in agg.values())
-            total_in_target_ms = sum(t for t, _ in agg.values()) * 1000
+            merged_total_ms = sum(t for t, _ in agg.values()) * 1000
+            main_agg = profiler.aggregate(thread="main")
+            main_total_ms = sum(t for t, _ in main_agg.values()) * 1000
             bucket_count = profiler.max_bucket + 1 if profiler._thread_state else 0
             rec_dur = profiler.recording_duration
             rec_dur_str = f"{rec_dur*1000:.2f} ms" if rec_dur is not None else "未记录"
             threads = profiler.list_threads()
+            active = [t for t in threads if profiler.aggregate(thread=t["tid"])]
+            silent = [t for t in threads if not profiler.aggregate(thread=t["tid"])]
 
             print("[TimedLineProfiler] 记录已结束，准备生成报告 ...", file=sys.stderr)
-            print(f"  记录时长:     {rec_dur_str}", file=sys.stderr)
+            print("  耗时口径（含义不同）：", file=sys.stderr)
+            print(
+                f"    wall-clock 时长 : {rec_dur_str}  程序真实流逝时间",
+                file=sys.stderr,
+            )
+            print(
+                f"    主线程累加耗时  : {main_total_ms:.2f} ms  仅主线程行级 sum",
+                file=sys.stderr,
+            )
+            print(
+                f"    合并累加耗时    : {merged_total_ms:.2f} ms  所有线程行级 sum",
+                file=sys.stderr,
+            )
             print(f"  涉及文件数:   {files_count}", file=sys.stderr)
             print(f"  命中行数:     {lines_count} (去重)", file=sys.stderr)
             print(f"  总命中次数:   {total_hits}", file=sys.stderr)
-            print(f"  目标内总耗时: {total_in_target_ms:.2f} ms", file=sys.stderr)
             print(
                 f"  时间窗口:     {bucket_count} 个 × {args.bucket} s", file=sys.stderr
             )
-            print(f"  涉及线程:     {len(threads)} 个", file=sys.stderr)
-            for t in threads:
+            print(
+                f"  涉及线程:     {len(active)} 个有命中"
+                + (f" + {len(silent)} 个 0 hits 已折叠" if silent else ""),
+                file=sys.stderr,
+            )
+            for t in active:
                 tag = " [main]" if t["is_main"] else ""
                 print(f"    - {t['name']:30s} (tid={t['tid']}){tag}", file=sys.stderr)
             print("=" * 100, file=sys.stderr)
 
-            text = render_text(profiler, threshold_ms=args.threshold_ms)
+            text = render_text(
+                profiler,
+                threshold_ms=args.threshold_ms,
+                per_thread_top_lines=args.per_thread_top_lines,
+                per_thread_top_funcs=args.per_thread_top_funcs,
+            )
             text_path = os.path.join(args.out, "report.txt")
             try:
                 with open(text_path, "w", encoding="utf-8") as f:
@@ -282,6 +317,8 @@ def main():
                 top_k=args.top_k,
                 top_ratio_pct=args.top_ratio,
                 threshold_ms=args.threshold_ms,
+                per_thread_top_lines=args.per_thread_top_lines,
+                per_thread_top_funcs=args.per_thread_top_funcs,
             )
 
     profiler = TimedLineProfiler(

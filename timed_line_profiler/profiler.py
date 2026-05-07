@@ -86,7 +86,8 @@ class TimedLineProfiler:
         self._inverted_caches: Dict = {}
 
         # 函数级 frame 进入时刻：key 是 id(frame)，跨线程不冲突，dict 单步操作 GIL 原子
-        self._frame_call_times: Dict[int, float] = {}
+        # 注：函数级 frame 进入时刻已由 per-thread state['call_stack'] 维护
+        # （旧版用 _frame_call_times[id(frame)] 全局 dict，已被替代以支持 self_time 计算）
 
         self._cuda_sync_fn = None
         if cuda_sync:
@@ -243,47 +244,59 @@ class TimedLineProfiler:
             return None
         if self._resolve(frame.f_code.co_filename) is None:
             return None
-        # 第一次见到该线程时注册 thread_state（本路径在每个线程的 trace 启动后调一次）
-        # threading 已在模块顶部导入
         tid = threading.get_ident()
         state = self._thread_state.get(tid)
         if state is None:
             state = self._get_or_init_thread_state(tid)
-        # frame 进入时间（用于函数级累加；frame_id 跨线程不冲突）
-        # generator 每次 next()/send() 也触发 call 事件，自然支持 yield 拆分计时。
-        self._frame_call_times[id(frame)] = time.perf_counter()
+        # 入栈：(call_time, callee_acc=0)
+        # generator 每次 next()/send() 也触发 'call'，自然支持 yield 拆分计时。
+        # 这里同时识别 generator（co_flags & 0x20 == CO_GENERATOR），用于报告标 ⓖ。
+        state["call_stack"].append([time.perf_counter(), 0.0])
+        if frame.f_code.co_flags & 0x20:
+            state["gen_funcs"].add(
+                (frame.f_code.co_filename, frame.f_code.co_firstlineno)
+            )
         return self._local_trace
 
     def _local_trace(self, frame, event, arg):
-        # threading 已在模块顶部导入
         tid = threading.get_ident()
-        # state 必定已存在（_global_trace 中已建）；防御性 fallback
         state = self._thread_state.get(tid)
         if state is None:
             state = self._get_or_init_thread_state(tid)
 
         if event == "return":
             # 函数级 + 行级在 return 事件统一处理（per-thread）。
-            # 函数级：从 _frame_call_times 取 call_time，累加到该线程的 func_bucket_data。
-            #         elapsed 用 max(call_time, start_wall) 裁剪到 recording 区间内。
+            # 函数级：从 call_stack 弹出该 frame 的 (call_time, callee_acc)，
+            #   - cumulative = now - max(call_time, start_wall)
+            #   - self_time  = cumulative - callee_acc（不含子调用）
+            #   累加到该线程 func_bucket_data，同时把 cumulative 加到 caller 的 callee_acc。
             # 行级：结算 last_line（return 行）真实耗时，避免跨函数边界把 caller 之后
-            #       非 target 代码错误累加到 callee return 行上。
+            #   非 target 代码错误累加到 callee return 行上。
             # generator 的 yield 由 sys.settrace 拆为 return/call 配对，因此 yield 期间
             # 等待时间天然不计入函数耗时。
-            fid = id(frame)
-            call_time = self._frame_call_times.pop(fid, None)
+            stack = state["call_stack"]
+            popped = stack.pop() if stack else None
             if not (self.recording and self.start_wall is not None):
                 return None
             if self._cuda_sync_fn is not None:
                 self._cuda_sync_fn()
             now = time.perf_counter()
-            # 函数级累加（写入当前线程的 func_bucket_data）
-            if call_time is not None:
+            # 函数级累加
+            if popped is not None:
+                call_time, callee_acc = popped
                 effective_start = (
                     call_time if call_time > self.start_wall else self.start_wall
                 )
                 if now > effective_start:
-                    f_elapsed = now - effective_start
+                    cumulative = now - effective_start
+                    # self_time：减去本 frame 内所有完成的子调用的 cumulative
+                    # callee_acc 已经只算了 effective_start 之后的部分（recording 内）
+                    # 但子调用如果在 recording 之前 call 而在 recording 内 return，
+                    # 其 cumulative 也是 effective 裁剪过的，所以一致。
+                    self_time = cumulative - callee_acc
+                    if self_time < 0:
+                        # 极端边界：浮点累计误差或 effective_start 裁剪不一致；钳制到 0。
+                        self_time = 0.0
                     f_bucket = int(
                         (effective_start - self.start_wall) / self.bucket_seconds
                     )
@@ -299,8 +312,12 @@ class TimedLineProfiler:
                             frame.f_code.co_firstlineno,
                         )
                         slot = state["func_bucket_data"][f_bucket][func_key]
-                        slot[0] += f_elapsed
-                        slot[1] += 1
+                        slot[0] += cumulative
+                        slot[1] += self_time
+                        slot[2] += 1
+                    # 把本 frame 的 cumulative 累加到 caller 的 callee_acc
+                    if stack:
+                        stack[-1][1] += cumulative
             # 行级累加（return 行真实耗时；写入当前线程的 bucket_data）
             last_line = state["last_line"]
             last_time = state["last_time"]
@@ -435,16 +452,14 @@ class TimedLineProfiler:
     def _get_or_init_thread_state(self, tid: int) -> dict:
         """获取或初始化指定线程的 state 容器。
 
-        第一次见到一个 tid 时：
-        - 创建空的 bucket_data / func_bucket_data
-        - 初始化 last_line / last_time
-        - 抓取 thread_meta（name、是否主线程、首次出现时刻）
-        清除 _agg_caches 让下次 aggregate() 重新计算（因为有新数据源了）。
+        函数级 slot 结构：``[cumulative_s, self_s, count]``
+        - cumulative_s: 函数 call→return 间总耗时（含子调用），= "wall-clock 含等待"
+        - self_s:        减去所有子调用 cumulative 后剩余 = 函数自己代码的时间
+        - count:         进入次数（generator 每次 next()/send() 算一次）
         """
         state = self._thread_state.get(tid)
         if state is not None:
             return state
-        # threading 已在模块顶部导入
         try:
             tname = threading.current_thread().name
         except Exception:
@@ -455,7 +470,15 @@ class TimedLineProfiler:
             "last_line": None,
             "last_time": None,
             "bucket_data": defaultdict(lambda: defaultdict(lambda: [0.0, 0])),
-            "func_bucket_data": defaultdict(lambda: defaultdict(lambda: [0.0, 0])),
+            "func_bucket_data": defaultdict(lambda: defaultdict(lambda: [0.0, 0.0, 0])),
+            # per-thread 调用栈：[(call_time, callee_acc), ...]
+            # callee_acc 是该 frame 内已完成的子调用 cumulative 之和；
+            # frame return 时：self_time = (now - call_time) - callee_acc
+            # 然后把 elapsed 加到 caller (栈倒数第二) 的 callee_acc 上。
+            "call_stack": [],
+            # 函数 first_lineno -> is_generator (co_flags & 0x20)
+            # 用于报告里给 generator 标 ⓖ。第一次见到该函数时记录。
+            "gen_funcs": set(),
             "meta": {
                 "name": tname,
                 "is_main": (tid == self._main_thread_id),
@@ -467,7 +490,6 @@ class TimedLineProfiler:
             },
         }
         self._thread_state[tid] = state
-        # 数据形状变了，缓存失效
         self._agg_caches.clear()
         self._func_agg_caches.clear()
         self._inverted_caches.clear()
@@ -579,23 +601,40 @@ class TimedLineProfiler:
         return agg
 
     def aggregate_funcs(self, thread=None) -> Dict[Tuple[str, str, int], List]:
-        """聚合函数级 (file, func_name, first_lineno) -> [total_time_s, call_count]。
+        """聚合函数级 (file, func_name, first_lineno) -> [cumulative_s, self_s, count]。
 
         - thread 参数语义同 aggregate()
-        - call_count 是该函数被进入的次数；generator 每次 next()/send() 都算一次
-        - total_time_s 是函数自身（含所有子调用）的执行时间，yield 之间等待不计入
+        - count 是该函数被进入的次数；generator 每次 next()/send() 都算一次
+        - cumulative_s: 函数 call→return 总时间（**含子调用**），= "wall-clock"
+        - self_s:        减去所有子调用 cumulative 后剩余 = "函数自己代码的耗时"
+        - yield 之间等待不计入（由 sys.settrace 的 return/call 配对自然实现）
         """
         cache_key = thread
         if cache_key in self._func_agg_caches:
             return self._func_agg_caches[cache_key]
-        agg: Dict[Tuple[str, str, int], List] = defaultdict(lambda: [0.0, 0])
+        agg: Dict[Tuple[str, str, int], List] = defaultdict(lambda: [0.0, 0.0, 0])
         for tid in self._resolve_thread_filter(thread):
             for bucket in self._thread_state[tid]["func_bucket_data"].values():
-                for k, (t, c) in bucket.items():
-                    agg[k][0] += t
-                    agg[k][1] += c
+                for k, (cumul, self_t, count) in bucket.items():
+                    agg[k][0] += cumul
+                    agg[k][1] += self_t
+                    agg[k][2] += count
         self._func_agg_caches[cache_key] = agg
         return agg
+
+    def is_generator_func(self, fn: str, first_lineno: int) -> bool:
+        """该函数是否是 generator（co_flags & 0x20）。
+
+        信息来自 'call' 事件时的 frame.f_code.co_flags 检查，跨所有线程合并。
+        """
+        # gen_funcs 在 state 里按 co_filename 存（可能与 _resolve 后的 fn 不同）
+        # 简单匹配：任一线程见过该 (resolved fn, lineno) 即认为是 generator
+        for state in self._thread_state.values():
+            for raw_fn, fl in state.get("gen_funcs", ()):
+                resolved = self._fname_cache.get(raw_fn)
+                if resolved == fn and fl == first_lineno:
+                    return True
+        return False
 
     def _build_inverted(
         self, thread=None
