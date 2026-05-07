@@ -6,6 +6,7 @@
   - 暴露 aggregate() / per_bucket_matrix() 给报告生成器消费
 """
 
+import linecache
 import os
 import re
 import sys
@@ -19,8 +20,8 @@ class TimedLineProfiler:
         self,
         target_files: Set[str],
         bucket_seconds: float = 5.0,
-        start_trigger: Optional[Tuple["re.Pattern", int, int]] = None,
-        stop_trigger: Optional[Tuple["re.Pattern", int, int]] = None,
+        start_trigger: Optional[dict] = None,
+        stop_trigger: Optional[dict] = None,
         cuda_sync: bool = False,
         target_patterns: Optional[List[Tuple[str, "re.Pattern"]]] = None,
         exclude_patterns: Optional[List[Tuple[str, "re.Pattern"]]] = None,
@@ -65,6 +66,16 @@ class TimedLineProfiler:
         self._inverted_cache: Optional[
             Dict[Tuple[str, int], List[Tuple[int, float]]]
         ] = None
+        self._func_agg_cache: Optional[Dict[Tuple[str, str, int], List]] = None
+
+        # 函数级统计：func_bucket_data[bucket][(fn, func_name, first_lineno)] = [time_s, count]
+        # 使用 'call' 事件记录 frame 进入时间，'return' 事件累加；
+        # generator 的每次 yield/恢复天然由 sys.settrace 拆为 return/call 配对，
+        # 因此 yield 之间的等待时间不会被计入函数耗时。
+        self.func_bucket_data: Dict[int, Dict[Tuple[str, str, int], List]] = (
+            defaultdict(lambda: defaultdict(lambda: [0.0, 0]))
+        )
+        self._frame_call_times: Dict[int, float] = {}
 
         self._cuda_sync_fn = None
         if cuda_sync:
@@ -145,14 +156,41 @@ class TimedLineProfiler:
 
     def _trigger_match(
         self,
-        trigger: Tuple["re.Pattern", int, int],
+        trigger: dict,
         abs_fn: str,
         lineno: int,
+        frame=None,
     ) -> bool:
-        regex, t_ln, _ = trigger
-        if lineno != t_ln:
+        """检查 line 事件 (abs_fn, lineno) 是否命中 trigger。
+
+        三种 kind：
+        - 'line':  fn 匹配 file_re 且 lineno == trigger['line']
+        - 'func':  fn 匹配 file_re 且 frame.f_code.co_name == func_name
+                   且 lineno == frame.f_code.co_firstlineno + offset
+        - 'regex': fn 匹配 file_re 且该行源码 search 命中 code_re（带缓存）
+        """
+        if not trigger["file_re"].search(abs_fn.replace(os.sep, "/")):
             return False
-        return regex.search(abs_fn.replace(os.sep, "/")) is not None
+        kind = trigger["kind"]
+        if kind == "line":
+            return lineno == trigger["line"]
+        if kind == "func":
+            if frame is None:
+                return False
+            return (
+                frame.f_code.co_name == trigger["func_name"]
+                and lineno == frame.f_code.co_firstlineno + trigger["offset"]
+            )
+        if kind == "regex":
+            cache = trigger["_cache"]
+            cache_key = (abs_fn, lineno)
+            if cache_key in cache:
+                return cache[cache_key]
+            line_text = linecache.getline(abs_fn, lineno)
+            matched = bool(trigger["code_re"].search(line_text))
+            cache[cache_key] = matched
+            return matched
+        return False
 
     def _do_stop_recording(self, now: float, reason: str):
         """统一的停止入口：触发任一 stop 条件时调用。
@@ -190,23 +228,55 @@ class TimedLineProfiler:
             return None
         if self._resolve(frame.f_code.co_filename) is None:
             return None
+        # 记录 frame 进入时间（无论 recording 与否；recording 之外的 call_time
+        # 在 return 时会被 max(call_time, start_wall) 截到 recording 区间内）。
+        # generator 每次 next() / send() 也会触发 call 事件，自然支持 yield 拆分计时。
+        self._frame_call_times[id(frame)] = time.perf_counter()
         return self._local_trace
 
     def _local_trace(self, frame, event, arg):
         if event == "return":
-            # 关键：在 frame return 时结算 last_line（即 return 行）的真实耗时，
-            # 然后清空 last_line/last_time，避免跨函数边界把 caller 之后的代码
-            # （含非 target 文件如 lightning/torch 内部、调用栈 unwind 等）错误累加到
-            # callee 的 return 行上。
-            if (
-                self.recording
-                and self.last_line is not None
-                and self.last_time is not None
-                and self.start_wall is not None
-            ):
-                if self._cuda_sync_fn is not None:
-                    self._cuda_sync_fn()
-                now = time.perf_counter()
+            # 函数级 + 行级在 return 事件统一处理。
+            # 行级：结算 last_line 即 return 行真实耗时，避免跨函数边界把 caller
+            #       之后非 target 代码错误累加到 callee return 行上。
+            # 函数级：从 _frame_call_times 取出该 frame 的 call_time，累加 elapsed
+            #        到 (file, func_name, first_lineno) 这个函数的总耗时上。
+            #        elapsed 用 max(call_time, start_wall) 裁剪到 recording 区间内。
+            #        generator 的 yield 由 sys.settrace 拆为 return/call 配对，
+            #        因此 yield 期间的等待时间天然不会被计入函数耗时。
+            fid = id(frame)
+            call_time = self._frame_call_times.pop(fid, None)
+            if not (self.recording and self.start_wall is not None):
+                return None
+            if self._cuda_sync_fn is not None:
+                self._cuda_sync_fn()
+            now = time.perf_counter()
+            # 函数级累加
+            if call_time is not None:
+                effective_start = (
+                    call_time if call_time > self.start_wall else self.start_wall
+                )
+                if now > effective_start:
+                    f_elapsed = now - effective_start
+                    f_bucket = int(
+                        (effective_start - self.start_wall) / self.bucket_seconds
+                    )
+                    if f_bucket < 0:
+                        f_bucket = 0
+                    if f_bucket > self.max_bucket:
+                        self.max_bucket = f_bucket
+                    fn_resolved = self._fname_cache.get(frame.f_code.co_filename)
+                    if fn_resolved is not None:
+                        func_key = (
+                            fn_resolved,
+                            frame.f_code.co_name,
+                            frame.f_code.co_firstlineno,
+                        )
+                        slot = self.func_bucket_data[f_bucket][func_key]
+                        slot[0] += f_elapsed
+                        slot[1] += 1
+            # 行级累加（return 行真实耗时）
+            if self.last_line is not None and self.last_time is not None:
                 elapsed = now - self.last_time
                 bucket = int((self.last_time - self.start_wall) / self.bucket_seconds)
                 if bucket < 0:
@@ -216,9 +286,9 @@ class TimedLineProfiler:
                 slot = self.bucket_data[bucket][self.last_line]
                 slot[0] += elapsed
                 slot[1] += 1
-                # 清空，让 caller 的下一次 line 事件不再结算 callee 的 return 行
-                self.last_line = None
-                self.last_time = None
+            # 清空跨函数状态
+            self.last_line = None
+            self.last_time = None
             return None  # frame 即将退出，不必再返回 trace 函数
 
         if event != "line":
@@ -234,10 +304,10 @@ class TimedLineProfiler:
             if (
                 self.start_trigger is not None
                 and not self._start_consumed
-                and self._trigger_match(self.start_trigger, fn, lineno)
+                and self._trigger_match(self.start_trigger, fn, lineno, frame)
             ):
                 self.start_hit += 1
-                if self.start_hit >= self.start_trigger[2]:
+                if self.start_hit >= self.start_trigger["n"]:
                     if self._cuda_sync_fn is not None:
                         self._cuda_sync_fn()
                     self.recording = True
@@ -271,10 +341,10 @@ class TimedLineProfiler:
         self.last_time = now
 
         if self.stop_trigger is not None and self._trigger_match(
-            self.stop_trigger, fn, lineno
+            self.stop_trigger, fn, lineno, frame
         ):
             self.stop_hit += 1
-            if self.stop_hit >= self.stop_trigger[2]:
+            if self.stop_hit >= self.stop_trigger["n"]:
                 self._do_stop_recording(now, f"{fn}:{lineno} 第 {self.stop_hit} 次")
                 return None
 
@@ -282,7 +352,7 @@ class TimedLineProfiler:
         if (
             self.profile_hits is not None
             and self.start_trigger is not None
-            and self._trigger_match(self.start_trigger, fn, lineno)
+            and self._trigger_match(self.start_trigger, fn, lineno, frame)
         ):
             self._profile_hits_count += 1
             if self._profile_hits_count >= self.profile_hits:
@@ -368,6 +438,23 @@ class TimedLineProfiler:
                 agg[k][0] += t
                 agg[k][1] += c
         self._agg_cache = agg
+        return agg
+
+    def aggregate_funcs(self) -> Dict[Tuple[str, str, int], List]:
+        """聚合函数级数据得到 (file, func_name, first_lineno) -> [total_time_s, call_count]。
+
+        - call_count 是该函数被进入的次数；generator 每次 next()/send() 都算一次。
+        - total_time_s 是函数自身（含所有子调用）的执行时间，但 yield 之间的等待
+          时间不计入（由 sys.settrace 的 return/call 配对自然实现）。
+        """
+        if self._func_agg_cache is not None:
+            return self._func_agg_cache
+        agg: Dict[Tuple[str, str, int], List] = defaultdict(lambda: [0.0, 0])
+        for bucket in self.func_bucket_data.values():
+            for k, (t, c) in bucket.items():
+                agg[k][0] += t
+                agg[k][1] += c
+        self._func_agg_cache = agg
         return agg
 
     def _build_inverted(self) -> Dict[Tuple[str, int], List[Tuple[int, float]]]:

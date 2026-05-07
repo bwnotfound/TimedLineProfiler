@@ -122,38 +122,60 @@ tlprof --target 'src/**/*.py' \
 
 四个参数共同控制"什么时候开始/停止记录"。
 
-**开始**：
+### LOCATOR 三种定位方式
 
-- `--start-at FILE:LINE[:N]`：当 FILE 第 LINE 行被命中第 N 次时开始记录；N 缺省为 1（首次命中即开始）。FILE 同样支持 glob/相对路径。
-- 不指定 `--start-at` → 程序一启动就记录。
+`--start-at` / `--stop-at` 接受 `FILE:LOCATOR[:N]` 形式，LOCATOR 有三种：
 
-**停止**（以下三者**任一先达到**就停止，OR 关系，与口语"取 min"等价）：
+| LOCATOR 形式     | 含义                                                                        | 例子                          |
+| ---------------- | --------------------------------------------------------------------------- | ----------------------------- |
+| `LINE`           | 绝对行号                                                                    | `train.py:120`                |
+| `@FUNC[+OFFSET]` | 函数 def 行 + offset（offset≥1 才能稳定触发，因 def 行本身没有 line event） | `loop.py:@step+2`             |
+| `~PATTERN`       | 用 regex 匹配该文件源码某一行                                               | `loop.py:~^\s*loss\.backward` |
 
-- `--stop-at FILE:LINE[:M]`：FILE 第 LINE 行被命中第 M 次时停止；M 缺省 1（绝对计数，从程序启动起算）。
-- `--profile-hits M`：开始记录后，**`--start-at` 那行**被再命中 M 次时停止（相对 start 计数）。需配合 `--start-at` 使用。
-- `--max-duration SEC`：开始记录后最多 SEC 秒就停止。
+`:N` 后缀（必须末尾纯数字）表示第 N 次匹配；缺省 N=1。N 解析规则：rsplit `:` 后**末尾纯数字段**且 rest 仍含 `:` 时才认作 N，否则末尾段是 LOCATOR。这意味着：
 
-举例："profile 主循环 100 步" 是常见需求：
+- `file.py:120` → LINE=120, N=1（兼容旧语法）
+- `file.py:120:5` → LINE=120, N=5（兼容旧语法）
+- `file.py:~hello:world` → PATTERN=`hello:world`, N=1（末尾 `world` 非数字，整体当 PATTERN）
+- `file.py:~run\d+:5` → PATTERN=`run\d+`, N=5（末尾 `5` 当 N；要 PATTERN 含末尾 `:数字` 请显式加 `:1`）
+
+### 开始
+
+- `--start-at FILE:LOCATOR[:N]`：上述三种方式之一触发开始记录
+- 不指定 `--start-at` → 程序一启动就记录
+
+### 停止
+
+以下三者**任一先达到**就停止（OR 关系，"取 min"）：
+
+- `--stop-at FILE:LOCATOR[:M]`：第 M 次命中（绝对计数，从程序启动起算）
+- `--profile-hits M`：开始记录后，**`--start-at` 那行/那个匹配点**再命中 M 次时停止（相对计数）。需配合 `--start-at`
+- `--max-duration SEC`：开始记录后最多 SEC 秒就停止
+
+### 例子
 
 ```bash
+# 行号模式（最常用）：profile 主循环 100 步
 tlprof --target 'mymodel/**/*.py' \
     --start-at 'mymodel/trainer/loop.py:120' \
-    --profile-hits 100 \
-    --out ./rep -- train.py
-```
+    --profile-hits 100 --out ./rep -- train.py
 
-举例："warmup 5 步后 profile 100 步，但最多 30 秒"：
-
-```bash
+# 函数偏移模式：进入 step 函数体第 2 行就开始（不必查具体行号）
 tlprof --target 'mymodel/**/*.py' \
-    --start-at 'mymodel/trainer/loop.py:120:5' \
-    --profile-hits 100 --max-duration 30 \
-    --out ./rep -- train.py
+    --start-at 'mymodel/trainer/loop.py:@step+2' \
+    --profile-hits 100 --out ./rep -- train.py
+
+# 正则模式：找含 loss.backward() 的那一行
+tlprof --target 'mymodel/**/*.py' \
+    --start-at 'mymodel/trainer/loop.py:~loss\.backward' \
+    --profile-hits 100 --out ./rep -- train.py
 ```
 
-> ⚠️ 当 `--start-at` / `--stop-at` / `--profile-hits` 涉及的 file 模式命中**多个文件**时，"第 N 次"是**全局累加**（跨文件计数）。要精确触发，请用具体单文件路径。
+> ⚠️ 当 trigger 涉及的 file 模式命中**多个文件**时，"第 N 次"是**全局累加**（跨文件计数）。要精确触发，请用具体单文件路径。
 
-> ⚠️ stop 之后 `--start-at` **不会再次触发**（防止 stop → start → stop 反复跳转）。如果你的 trigger 行就是循环体内某行，这一点尤其重要。
+> ⚠️ stop 之后 `--start-at` **不会再次触发**（防止 stop → start → stop 反复跳转）。
+
+> ⚠️ 函数偏移模式 `@FUNC+OFFSET`：offset 是相对该函数 def 行的偏移（def 行算 0），所以 offset=1 是 def 下面第 1 行，offset=2 是第 2 行……。注意 offset=0 即 def 行本身在 Python 中通常**不会**触发 line event，要稳定命中请用 ≥1。
 
 ## 选行规则：每文件 `max(top-k, ratio 触发数)`
 
@@ -301,6 +323,17 @@ profiler 尽力在程序异常退出时仍输出已采集到的数据：
 
 - 同样崩溃 → 与 profiler 无关，是训练环境本身的兼容性问题（lightning vs torch 版本、optimizer state 类型等），需要在不带 profiler 的环境里先解决
 - 仅 tlprof 下崩溃 → 是 profiler 的 trace 干扰，请提交 issue 并附上完整 traceback
+
+## 函数级耗时统计
+
+除了行级数据，每份报告（text / md）的每个文件后会列出该文件中**所有函数的总耗时**。
+
+- **总耗时含子调用**：与 cProfile 的 cumulative time 一致——`A` 调用 `B`，`A` 的耗时含 `B` 的全部时间
+- **generator / yield 自动正确处理**：`sys.settrace` 把 yield 视为一次 return（值带在 arg 里），下次 `next()` 时再触发 call。两段时间分别累加，**yield 之间消费者的等待时间不会被计入 generator**
+- `call_count` 是函数被进入的次数。注意 generator 函数：**创建 generator 对象本身**也算一次 call/return（耗时近 0），所以 `call_count = 1（创建）+ N（实际 next() 次数）`
+- 数据生成机制：在 `'call'` 事件记录 frame 进入时间，`'return'` 事件累加 `now - max(call_time, recording_start)` 到该函数
+
+例子（已在 `examples/` 中给出）：caller 在 yield 之间 sleep 1.5s 不会被算到 generator 函数上，generator 仅记录它自己 yield 段的真实工作时间。
 
 ## 已知局限
 

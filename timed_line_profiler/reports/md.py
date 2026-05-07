@@ -102,6 +102,42 @@ def render_markdown(
             )
         lines.append("")
 
+    # ---- 函数级耗时 ----
+    func_agg = profiler.aggregate_funcs()
+    if func_agg:
+        funcs_by_file: Dict[str, List[Tuple[str, int, float, int]]] = defaultdict(list)
+        for (fn, fname, fl), (t, c) in func_agg.items():
+            funcs_by_file[fn].append((fname, fl, t, c))
+
+        lines.append("## 函数级耗时（含子调用；yield 之间等待时间不计入）")
+        lines.append("")
+        lines.append(
+            "_call_count 是函数被进入的次数；generator 每次 next()/send() "
+            "都算一次（创建生成器对象本身也算一次）_"
+        )
+        lines.append("")
+        for fn in sorted(funcs_by_file, key=lambda x: -file_total.get(x, 0)):
+            funcs_sorted = sorted(funcs_by_file[fn], key=lambda x: -x[2])
+            funcs_kept = [f for f in funcs_sorted if f[2] * 1000 >= threshold_ms]
+            if not funcs_kept:
+                continue
+            lines.append(f"### `{fn}`")
+            lines.append("")
+            lines.append(
+                "| 函数 | def 行 | 总耗时(ms) | 调用次数 | 平均(ms) | 文件内占比 |"
+            )
+            lines.append("|---|---:|---:|---:|---:|---:|")
+            f_total_ms = file_total[fn] * 1000
+            for fname, fl, t, c in funcs_kept:
+                ms = t * 1000
+                avg = ms / c if c else 0.0
+                file_pct = ms / f_total_ms * 100 if f_total_ms else 0.0
+                lines.append(
+                    f"| `{fname}` | {fl} | {ms:.2f} | {c} | {avg:.4f} | "
+                    f"{file_pct:.1f}% |"
+                )
+            lines.append("")
+
     # ---- 选中行的 bucket 分布 ----
     selected_keys = select_keys_per_file(agg, top_k, top_ratio_pct)
     if bucket_count >= 1 and selected_keys:

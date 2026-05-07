@@ -8,7 +8,7 @@ from ..profiler import TimedLineProfiler
 
 
 def render_text(profiler: TimedLineProfiler, threshold_ms: float = 0.0) -> str:
-    """生成 LineProfiler 风格的文本汇总（每文件全行，按行号排）。"""
+    """生成 LineProfiler 风格的文本汇总（每文件全行 + 函数级耗时表，按行号排）。"""
     agg = profiler.aggregate()
     if not agg:
         return "[TimedLineProfiler] 没有收集到任何性能数据\n"
@@ -18,6 +18,12 @@ def render_text(profiler: TimedLineProfiler, threshold_ms: float = 0.0) -> str:
     for (fn, ln), (t, c) in agg.items():
         files_data[fn].append((ln, t, c))
         file_total[fn] += t
+
+    # 函数级数据按文件分组
+    func_agg = profiler.aggregate_funcs()
+    funcs_by_file: Dict[str, List[Tuple[str, int, float, int]]] = defaultdict(list)
+    for (fn, fname, fl), (t, c) in func_agg.items():
+        funcs_by_file[fn].append((fname, fl, t, c))
 
     out: List[str] = []
     sep = "=" * 100
@@ -51,4 +57,35 @@ def render_text(profiler: TimedLineProfiler, threshold_ms: float = 0.0) -> str:
                         f"{ln:>{ln_w}} | {ms:>{time_w}.2f} | {c:>8} | "
                         f"{avg:>10.4f} | {code}"
                     )
+
+        # 函数耗时小节（按 total 降序）
+        funcs = funcs_by_file.get(fn)
+        if funcs:
+            funcs_sorted = sorted(funcs, key=lambda x: -x[2])
+            max_fname_w = max(8, max(len(f[0]) for f in funcs_sorted))
+            max_fms = max(f[2] * 1000 for f in funcs_sorted)
+            fms_w = max(10, len(f"{max_fms:.2f}"))
+            out.append("")
+            out.append(
+                f"  函数耗时（含子调用；yield 之间等待时间不计入）："
+                f"{len(funcs_sorted)} 个函数"
+            )
+            out.append(
+                f"  {'函数名'.ljust(max_fname_w)} | "
+                f"{'def 行'.rjust(6)} | {'总耗时(ms)'.rjust(fms_w)} | "
+                f"{'调用次数'.rjust(8)} | {'平均(ms)'.rjust(10)}"
+            )
+            out.append(
+                f"  {'-' * max_fname_w}-+-{'-' * 6}-+-{'-' * fms_w}-+-"
+                f"{'-' * 8}-+-{'-' * 10}"
+            )
+            for fname, fl, t, c in funcs_sorted:
+                ms = t * 1000
+                if ms < threshold_ms:
+                    continue
+                avg = ms / c if c else 0.0
+                out.append(
+                    f"  {fname.ljust(max_fname_w)} | {fl:>6} | "
+                    f"{ms:>{fms_w}.2f} | {c:>8} | {avg:>10.4f}"
+                )
     return "\n".join(out) + "\n"

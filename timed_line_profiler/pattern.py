@@ -163,31 +163,95 @@ def resolve_excludes(
     return out
 
 
-def parse_trigger(spec: Optional[str]) -> Optional[Tuple["re.Pattern", int, int]]:
-    """解析 'FILE:LINE' 或 'FILE:LINE:N'，N 缺省为 1。
+def parse_trigger(spec: Optional[str]) -> Optional[dict]:
+    """解析 trigger 表达式，返回 dict 或 None。
 
-    file_spec 支持具体文件 / glob / 相对路径模式。
-    返回 (regex, line, n)。具体文件存在 -> 编译为该 abs path 的精确尾匹配 regex；
-    否则 -> glob_to_regex。
+    支持的 LOCATOR 形式（FILE 部分均支持具体路径 / glob / 相对路径）：
+
+    - ``FILE:LINE``           行号触发
+    - ``FILE:LINE:N``         行号 + 第 N 次
+    - ``FILE:@FUNC``          函数 def 行触发（offset=0；注意 def 行通常无 line event）
+    - ``FILE:@FUNC+OFFSET``   函数内偏移行（offset≥1 才能稳定触发）
+    - ``FILE:@FUNC[+OFFSET]:N``  上面 + 第 N 次
+    - ``FILE:~PATTERN``       该文件中代码内容匹配 regex 的某一行触发
+    - ``FILE:~PATTERN:N``     上面 + 第 N 次
+
+    返回 dict::
+
+        {'kind':'line',  'file_re':..., 'line':int,            'n':int}
+        {'kind':'func',  'file_re':..., 'func_name':str,
+                          'offset':int,                         'n':int}
+        {'kind':'regex', 'file_re':..., 'code_re':re.Pattern,
+                          '_cache':dict,                        'n':int}
+
+    解析规则：先 rsplit(':', 1) 取末尾纯数字段为 N（不是数字则 N 默认 1），
+    剩余部分以第一个 ':' 拆为 FILE / LOCATOR；LOCATOR 按首字符分流。
     """
     if spec is None:
         return None
-    # 优先尝试 FILE:LINE:N（最后两段都是纯数字）
-    parts3 = spec.rsplit(":", 2)
-    if len(parts3) == 3 and parts3[1].isdigit() and parts3[2].isdigit():
-        fn, ln_s, n_s = parts3
-        ln, n = int(ln_s), int(n_s)
+
+    # 1) 末尾 :N（必须纯数字 + rest 仍含 ':'，否则末尾段是 LOCATOR 而非 N）
+    parts = spec.rsplit(":", 1)
+    if len(parts) == 2 and parts[1].isdigit() and ":" in parts[0]:
+        rest, n = parts[0], int(parts[1])
     else:
-        # 退而 FILE:LINE，N 默认 1
-        parts2 = spec.rsplit(":", 1)
-        if len(parts2) != 2 or not parts2[1].isdigit():
-            raise ValueError(
-                f"trigger 格式应为 FILE:LINE 或 FILE:LINE:N，实际收到: {spec}"
-            )
-        fn, ln, n = parts2[0], int(parts2[1]), 1
-    if os.path.exists(fn):
-        abs_norm = os.path.abspath(fn).replace(os.sep, "/")
-        regex = re.compile(r"(?:^|/)" + re.escape(abs_norm.lstrip("/")) + "$")
+        rest, n = spec, 1
+
+    # 2) 分离 FILE / LOCATOR
+    file_part, sep, locator = rest.partition(":")
+    if not sep or not locator:
+        raise ValueError(
+            f"trigger 格式错误，缺少 LOCATOR (期望 FILE:LINE / FILE:@FUNC[+N] / "
+            f"FILE:~REGEX): {spec}"
+        )
+
+    # 3) FILE 部分：具体文件 → abs path 尾匹配；否则 glob
+    if os.path.exists(file_part):
+        abs_norm = os.path.abspath(file_part).replace(os.sep, "/")
+        file_re = re.compile(r"(?:^|/)" + re.escape(abs_norm.lstrip("/")) + "$")
     else:
-        regex = glob_to_regex(fn)
-    return (regex, ln, n)
+        file_re = glob_to_regex(file_part)
+
+    # 4) LOCATOR 按首字符分流
+    if locator.startswith("@"):
+        body = locator[1:]
+        if "+" in body:
+            func_name, _, off_s = body.rpartition("+")
+            try:
+                offset = int(off_s)
+            except ValueError:
+                raise ValueError(f"trigger 中 offset 必须是整数: {off_s!r}")
+        else:
+            func_name, offset = body, 0
+        if not func_name:
+            raise ValueError(f"trigger 中 @ 后必须有函数名: {locator!r}")
+        return {
+            "kind": "func",
+            "file_re": file_re,
+            "func_name": func_name,
+            "offset": offset,
+            "n": n,
+        }
+
+    if locator.startswith("~"):
+        pattern_str = locator[1:]
+        if not pattern_str:
+            raise ValueError(f"trigger 中 ~ 后必须有 regex: {locator!r}")
+        try:
+            code_re = re.compile(pattern_str)
+        except re.error as e:
+            raise ValueError(f"trigger 中 regex 编译失败 ({pattern_str!r}): {e}")
+        return {
+            "kind": "regex",
+            "file_re": file_re,
+            "code_re": code_re,
+            "_cache": {},
+            "n": n,
+        }
+
+    if locator.isdigit():
+        return {"kind": "line", "file_re": file_re, "line": int(locator), "n": n}
+
+    raise ValueError(
+        f"trigger 中 LOCATOR 必须是 LINE / @FUNC[+N] / ~PATTERN: {locator!r}"
+    )
