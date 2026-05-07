@@ -248,7 +248,13 @@ def main():
             print("=" * 100, file=sys.stderr)
 
             text = render_text(profiler, threshold_ms=args.threshold_ms)
-            print(text)
+            text_path = os.path.join(args.out, "report.txt")
+            try:
+                with open(text_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                print(f"[ok] Text 报告已写入: {text_path}", file=sys.stderr)
+            except OSError as e:
+                print(f"[warn] 写入 {text_path} 失败: {e}", file=sys.stderr)
             html_path = os.path.join(args.out, "report.html")
             md_path = os.path.join(args.out, "report.md")
             render_html(

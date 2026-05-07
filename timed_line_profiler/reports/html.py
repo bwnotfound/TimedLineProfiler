@@ -280,6 +280,15 @@ def render_html(
     fig.add_traces(all_traces, rows=all_rows, cols=all_cols)
     total_traces = cur
 
+    # ---- 每视图独立计算 figure 高度（dropdown 切换时同步更新） ----
+    LEGEND_H = 110  # 底部水平 legend 预留空间
+
+    def _calc_view_height(n_keys: int) -> int:
+        heatmap_h = max(220, n_keys * 16 + 100)
+        line_h = 320
+        table_h = max(200, n_keys * 24 + 80)
+        return heatmap_h + line_h + table_h + 250 + LEGEND_H
+
     # ---- dropdown buttons ----
     buttons = []
     for v_idx, (label, keys, _, _) in enumerate(views):
@@ -303,6 +312,7 @@ def render_html(
                 args=[
                     {"visible": visibility},
                     {
+                        "height": _calc_view_height(n_keys),
                         "annotations[0].text": new_titles[0],
                         "annotations[1].text": new_titles[1],
                         "annotations[2].text": new_titles[2],
@@ -311,13 +321,8 @@ def render_html(
             )
         )
 
-    # ---- 高度按全局视图行数定 ----
-    n = len(global_keys)
-    heatmap_h = max(220, n * 16 + 100)
-    line_h = 320
-    table_h = max(200, n * 24 + 80)
-    legend_h = 110  # 给底部水平 legend 预留（带代码片段后单条较长，可能占 2-3 行）
-    total_h = heatmap_h + line_h + table_h + 250 + legend_h
+    # ---- 初始高度按默认（第 0 个）视图行数定 ----
+    total_h = _calc_view_height(len(global_keys))
 
     fig.update_layout(
         title=(
@@ -340,7 +345,7 @@ def render_html(
             font=dict(size=10, family="monospace"),
             itemsizing="constant",
         ),
-        margin=dict(b=legend_h + 20),
+        margin=dict(b=LEGEND_H + 20),
         updatemenus=[
             dict(
                 buttons=buttons,
