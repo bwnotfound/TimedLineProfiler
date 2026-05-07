@@ -193,6 +193,34 @@ class TimedLineProfiler:
         return self._local_trace
 
     def _local_trace(self, frame, event, arg):
+        if event == "return":
+            # 关键：在 frame return 时结算 last_line（即 return 行）的真实耗时，
+            # 然后清空 last_line/last_time，避免跨函数边界把 caller 之后的代码
+            # （含非 target 文件如 lightning/torch 内部、调用栈 unwind 等）错误累加到
+            # callee 的 return 行上。
+            if (
+                self.recording
+                and self.last_line is not None
+                and self.last_time is not None
+                and self.start_wall is not None
+            ):
+                if self._cuda_sync_fn is not None:
+                    self._cuda_sync_fn()
+                now = time.perf_counter()
+                elapsed = now - self.last_time
+                bucket = int((self.last_time - self.start_wall) / self.bucket_seconds)
+                if bucket < 0:
+                    bucket = 0
+                if bucket > self.max_bucket:
+                    self.max_bucket = bucket
+                slot = self.bucket_data[bucket][self.last_line]
+                slot[0] += elapsed
+                slot[1] += 1
+                # 清空，让 caller 的下一次 line 事件不再结算 callee 的 return 行
+                self.last_line = None
+                self.last_time = None
+            return None  # frame 即将退出，不必再返回 trace 函数
+
         if event != "line":
             return self._local_trace
 
@@ -294,6 +322,8 @@ class TimedLineProfiler:
     def stop(self):
         if not self.enabled:
             return
+        now = time.perf_counter()
+        # 最后一行的耗时累加（仅当还有未结算的 last_line 时；return 事件已结算的不会进这里）
         if (
             self.recording
             and self.last_line is not None
@@ -302,7 +332,7 @@ class TimedLineProfiler:
         ):
             if self._cuda_sync_fn is not None:
                 self._cuda_sync_fn()
-            now = time.perf_counter()
+                now = time.perf_counter()
             elapsed = now - self.last_time
             bucket = int((self.last_time - self.start_wall) / self.bucket_seconds)
             if bucket < 0:
@@ -312,9 +342,14 @@ class TimedLineProfiler:
             slot = self.bucket_data[bucket][self.last_line]
             slot[0] += elapsed
             slot[1] += 1
-            # 程序自然退出但 stop trigger 没触发：用此刻作为 recording 结束时刻
-            if self.recording_duration is None:
-                self.recording_duration = now - self.start_wall
+        # recording_duration 兜底：独立判断，无论上面累加块是否进入都设置
+        # （比如最后一帧已被 return 事件结算清空 last_line 时，仍能记到时长）
+        if (
+            self.recording
+            and self.recording_duration is None
+            and self.start_wall is not None
+        ):
+            self.recording_duration = now - self.start_wall
         sys.settrace(self.previous_trace)
         self.enabled = False
 
