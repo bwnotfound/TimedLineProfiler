@@ -212,24 +212,16 @@ def main():
         )
         sys.exit(2)
 
-    profiler = TimedLineProfiler(
-        target_files=abs_targets,
-        bucket_seconds=args.bucket,
-        start_trigger=start_trig,
-        stop_trigger=stop_trig,
-        cuda_sync=args.cuda_sync,
-        target_patterns=rel_patterns,
-        exclude_patterns=excludes,
-        profile_hits=args.profile_hits,
-        max_duration=args.max_duration,
-    )
-
     finalize_done = [False]
+    profiler_holder = [None]  # 闭包占位，让 finalize 能引用 profiler
 
     def finalize():
         if finalize_done[0]:
             return
         finalize_done[0] = True
+        profiler = profiler_holder[0]
+        if profiler is None:
+            return
         try:
             profiler.stop()
         finally:
@@ -274,6 +266,20 @@ def main():
                 top_ratio_pct=args.top_ratio,
                 threshold_ms=args.threshold_ms,
             )
+
+    profiler = TimedLineProfiler(
+        target_files=abs_targets,
+        bucket_seconds=args.bucket,
+        start_trigger=start_trig,
+        stop_trigger=stop_trig,
+        cuda_sync=args.cuda_sync,
+        target_patterns=rel_patterns,
+        exclude_patterns=excludes,
+        profile_hits=args.profile_hits,
+        max_duration=args.max_duration,
+        on_stop_callback=finalize,  # stop 触发时立即写报告，不必等程序结束
+    )
+    profiler_holder[0] = profiler
 
     atexit.register(finalize)
 

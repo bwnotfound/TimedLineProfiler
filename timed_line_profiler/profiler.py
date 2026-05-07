@@ -26,6 +26,7 @@ class TimedLineProfiler:
         exclude_patterns: Optional[List[Tuple[str, "re.Pattern"]]] = None,
         profile_hits: Optional[int] = None,
         max_duration: Optional[float] = None,
+        on_stop_callback=None,
     ):
         self.target_files: Set[str] = set(target_files)
         self.target_patterns: List[Tuple[str, "re.Pattern"]] = list(
@@ -39,6 +40,7 @@ class TimedLineProfiler:
         self.stop_trigger = stop_trigger
         self.profile_hits = profile_hits
         self.max_duration = max_duration
+        self._on_stop_callback = on_stop_callback
         self.start_hit = 0
         self.stop_hit = 0
         self._profile_hits_count = 0
@@ -152,6 +154,37 @@ class TimedLineProfiler:
             return False
         return regex.search(abs_fn.replace(os.sep, "/")) is not None
 
+    def _do_stop_recording(self, now: float, reason: str):
+        """统一的停止入口：触发任一 stop 条件时调用。
+
+        关键动作（按顺序）：
+          1. 标记 recording 结束并固化 recording_duration
+          2. 立刻 sys.settrace(None) 关闭全局 trace —— 让用户剩余代码以原速运行
+          3. 当前 frame 的 caller 应 return None 让 f_trace 也清掉
+          4. 调用 on_stop_callback（通常是 cli 的 finalize）让报告立刻落盘，
+             用户不必等程序自然结束
+        """
+        self.recording = False
+        self.recording_duration = now - self.start_wall
+        self.last_line = None
+        sys.settrace(self.previous_trace)
+        self.enabled = False
+        print(f"[info] 触发停止记录: {reason}", file=sys.stderr)
+        print(
+            "[info] 已关闭 sys.settrace；剩余用户代码将以原速运行（profile 数据已采集完毕）",
+            file=sys.stderr,
+        )
+        if self._on_stop_callback is not None:
+            try:
+                self._on_stop_callback()
+            except Exception as e:
+                import traceback
+
+                print(
+                    f"[warn] on-stop 回调失败: {type(e).__name__}: {e}", file=sys.stderr
+                )
+                traceback.print_exc(file=sys.stderr)
+
     def _global_trace(self, frame, event, arg):
         if event != "call":
             return None
@@ -214,14 +247,8 @@ class TimedLineProfiler:
         ):
             self.stop_hit += 1
             if self.stop_hit >= self.stop_trigger[2]:
-                self.recording = False
-                self.recording_duration = now - self.start_wall
-                self.last_line = None
-                print(
-                    f"[info] 触发停止记录: {fn}:{lineno} 第 {self.stop_hit} 次",
-                    file=sys.stderr,
-                )
-                return self._local_trace
+                self._do_stop_recording(now, f"{fn}:{lineno} 第 {self.stop_hit} 次")
+                return None
 
         # profile_hits：开始记录后再命中 start trigger 那行 N 次
         if (
@@ -231,15 +258,10 @@ class TimedLineProfiler:
         ):
             self._profile_hits_count += 1
             if self._profile_hits_count >= self.profile_hits:
-                self.recording = False
-                self.recording_duration = now - self.start_wall
-                self.last_line = None
-                print(
-                    f"[info] 触发停止记录: --profile-hits 达到 "
-                    f"{self._profile_hits_count} 次",
-                    file=sys.stderr,
+                self._do_stop_recording(
+                    now, f"--profile-hits 达到 {self._profile_hits_count} 次"
                 )
-                return self._local_trace
+                return None
 
         # max_duration：开始记录后限时
         if (
@@ -247,15 +269,12 @@ class TimedLineProfiler:
             and self.start_wall is not None
             and now - self.start_wall >= self.max_duration
         ):
-            self.recording = False
-            self.recording_duration = now - self.start_wall
-            self.last_line = None
-            print(
-                f"[info] 触发停止记录: --max-duration {self.max_duration}s 到时 "
+            self._do_stop_recording(
+                now,
+                f"--max-duration {self.max_duration}s 到时 "
                 f"(实际 {now - self.start_wall:.3f}s)",
-                file=sys.stderr,
             )
-            return self._local_trace
+            return None
 
         return self._local_trace
 
